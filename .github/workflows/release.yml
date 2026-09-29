@@ -1,0 +1,133 @@
+# Builds, packages and publishes a release when a version tag is pushed:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Without Apple signing secrets, releases are ad-hoc signed and users confirm the
+# first launch in System Settings. Add these secrets to sign and notarize:
+#   DEVELOPER_ID_IDENTITY       e.g. "Developer ID Application: Askantis (TEAMID)"
+#   DEVELOPER_ID_P12_BASE64     the certificate and key, exported as .p12, base64
+#   DEVELOPER_ID_P12_PASSWORD
+#   KEYCHAIN_PASSWORD           any random string
+#   ASC_API_KEY_P8_BASE64       App Store Connect API key for notarytool, base64
+#   ASC_API_KEY_ID
+#   ASC_API_ISSUER_ID
+# And to update the Homebrew cask in Askantis/homebrew-tap:
+#   TAP_GITHUB_TOKEN            fine-grained token with write access to that repo
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      SIGNING: ${{ secrets.DEVELOPER_ID_IDENTITY != '' }}
+      TAP: ${{ secrets.TAP_GITHUB_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Releases can also be built and notarized locally and uploaded by hand
+      # (see docs/RELEASING.md); then there's nothing to do here.
+      - name: Skip if the release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set version from tag
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" Support/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" Support/Info.plist
+
+      - name: Import Developer ID certificate
+        if: steps.existing.outputs.skip != 'true' && (env.SIGNING == 'true')
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+
+      - name: Build app
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
+        run: |
+          scripts/build-app.sh
+          codesign --verify --strict --verbose=2 "build/Local Router.app"
+
+      - name: Notarize app
+        if: steps.existing.outputs.skip != 'true' && (env.SIGNING == 'true')
+        env:
+          ASC_KEY_B64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_ISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          echo "$ASC_KEY_B64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --sequesterRsrc --keepParent "build/Local Router.app" build/notarize.zip
+          xcrun notarytool submit build/notarize.zip --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER" --wait
+          xcrun stapler staple "build/Local Router.app"
+
+      - name: Package ZIP and DMG
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
+        run: scripts/package.sh
+
+      - name: Notarize DMG
+        if: steps.existing.outputs.skip != 'true' && (env.SIGNING == 'true')
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_ISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          xcrun notarytool submit dist/Local-Router.dmg --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER" --wait
+          xcrun stapler staple dist/Local-Router.dmg
+          ( cd dist && shasum -a 256 Local-Router.zip Local-Router.dmg > SHA256SUMS.txt )
+
+      - name: Create GitHub release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Local Router $VERSION" --generate-notes --verify-tag
+
+      - name: Update Homebrew cask
+        if: steps.existing.outputs.skip != 'true' && (env.TAP == 'true')
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          SHA=$(shasum -a 256 dist/Local-Router.zip | cut -d' ' -f1)
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/Askantis/homebrew-tap.git" tap
+          cd tap
+          sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/" Casks/local-router.rb
+          sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" Casks/local-router.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "local-router $VERSION"
+          git push
+
+      - name: Remove keychain
+        if: steps.existing.outputs.skip != 'true' && (always() && env.SIGNING == 'true')
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true

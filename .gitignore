@@ -1,0 +1,14 @@
+# Build output
+.build/
+dist/
+build/
+dist/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+
+# Private working notes (research, plans with personal setup)
+notes/
+
+# macOS
+.DS_Store
