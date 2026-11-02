@@ -52,7 +52,7 @@ async fn an_app_connects_and_uses_its_roles() {
     assert!(ai.is_connected());
 
     client.disconnect().await.unwrap();
-    assert!(matches!(client.me().await, Err(Error::Api(e)) if e.code == "not_approved"));
+    assert!(matches!(client.me().await, Err(Error::Api(ref e)) if e.code == "not_approved"));
 }
 
 /// The embedded engine and the service give the same transcript for the same

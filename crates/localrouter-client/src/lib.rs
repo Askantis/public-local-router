@@ -30,7 +30,7 @@ pub const DOWNLOAD_URL: &str = "https://github.com/Askantis/public-local-router/
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Local Router answered: {0}")]
-    Api(ApiError),
+    Api(Box<ApiError>),
     #[error("couldn't reach Local Router: {0}")]
     Transport(String),
     #[error("the user didn't allow the connection")]
@@ -54,6 +54,7 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// What [`discover`] found.
+#[allow(clippy::large_enum_variant)] // returned once, at discovery
 pub enum Presence {
     Running(Client),
     /// Installed but not running: offer to [`start`] it.
@@ -71,13 +72,11 @@ pub async fn discover() -> Presence {
 /// [`discover`] with an explicit support folder (tests, development).
 pub async fn discover_in(support_dir: &Path) -> Presence {
     if let Ok(ep) = Endpoint::read(&support_dir.join("endpoint.json")) {
-        if let Ok(client) = Client::new(&ep) {
-            if let Ok(h) = client.health().await {
-                if h.instance_id == ep.instance_id {
+        if let Ok(client) = Client::new(&ep)
+            && let Ok(h) = client.health().await
+                && h.instance_id == ep.instance_id {
                     return Presence::Running(client);
                 }
-            }
-        }
         return if installed() { Presence::Unreachable } else { Presence::NotInstalled };
     }
     if installed() { Presence::Installed } else { Presence::NotInstalled }
@@ -244,7 +243,7 @@ impl Client {
         let mut err: ApiError = serde_json::from_value(body["error"].clone())
             .unwrap_or_else(|_| ApiError::new(status, "server_error", "internal", body.to_string()));
         err.status = status;
-        Err(Error::Api(err))
+        Err(Error::Api(Box::new(err)))
     }
 
     async fn json<T: serde::de::DeserializeOwned>(&self, req: reqwest::RequestBuilder) -> Result<T> {
@@ -350,6 +349,7 @@ impl Client {
 }
 
 /// One way to run speech in an app, with or without Local Router.
+#[allow(clippy::large_enum_variant)] // one per app
 pub enum LocalAi {
     Connected(Client),
     #[cfg(feature = "embedded")]

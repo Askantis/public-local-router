@@ -56,8 +56,7 @@ pub async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut s: S, method:
 
 pub fn dechunk(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(nl) = b.windows(2).position(|w| w == b"\r\n") else { break };
+    while let Some(nl) = b.windows(2).position(|w| w == b"\r\n") {
         let size = usize::from_str_radix(std::str::from_utf8(&b[..nl]).unwrap().trim(), 16).unwrap_or(0);
         if size == 0 {
             break;
