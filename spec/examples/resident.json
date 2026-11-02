@@ -1,0 +1,6 @@
+{ "models": [
+    { "name": "whisper", "kind": "asr", "display_name": "Whisper Large v3 Turbo",
+      "memory_bytes": 1650000000, "state": "loaded", "device": "gpu",
+      "source": "hf:ggerganov/whisper.cpp/ggml-large-v3-turbo-q8_0.bin" }
+  ],
+  "lease_seconds": 60 }

@@ -1,0 +1,12 @@
+{
+  "status": "approved",
+  "app": {
+    "app_id": "app.askantis.scribely", "name": "Scribely", "version": "2.0.0", "publisher": "Askantis",
+    "trust": "askantis", "connected_at": "2026-11-02T09:42:10Z", "last_used": null,
+    "roles": [
+      { "role": "transcribe", "capability": "transcription", "model": "hf:ggerganov/whisper.cpp/ggml-large-v3-turbo-q8_0.bin", "source": "global", "required": true },
+      { "role": "diarize", "capability": "diarization", "model": "hf:avencera/speakrs-models", "source": "suggestion", "required": true },
+      { "role": "chapters", "capability": "chat", "model": "qwen3.5:9b", "source": "global", "label": "Chapters", "required": false }
+    ]
+  }
+}

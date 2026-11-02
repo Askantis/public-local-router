@@ -1,0 +1,9 @@
+{
+  "id": "dl_7Q2x",
+  "model": "hf:askantis/gruezi-v1",
+  "source": "mirror",
+  "state": "running",
+  "bytes_done": 104857600,
+  "bytes_total": 874000000,
+  "started_by_you": true
+}

@@ -1,0 +1,5 @@
+{ "protocols": [1], "daemon_version": "2.0.0", "instance_id": "6f1d1c2e-8f0b-4b8e-9d55-0a3f0b6c3a10",
+  "capabilities": ["connect", "roles", "resident", "downloads", "events", "audio.transcriptions",
+                   "audio.diarizations", "chat", "embeddings", "ollama.passthrough"],
+  "ollama": { "state": "running", "version": "0.34.4" },
+  "hf_cache": { "path": "/Users/me/.cache/huggingface/hub", "state": "ok" } }

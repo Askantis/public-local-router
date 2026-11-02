@@ -1,0 +1,1079 @@
+openapi: 3.1.0
+info:
+  title: Local Router Protocol
+  version: "1.0.0-draft.1"
+  summary: How apps connect to Local Router and use the models it manages.
+  description: |
+    Machine-readable companion to PROTOCOL.md. Where the two disagree, PROTOCOL.md wins.
+
+    localrouterd listens on a Unix socket (preferred, callers identified by code signature)
+    and on 127.0.0.1:11436 (callers send an `lra_` key). See PROTOCOL.md, sections 3 to 5.
+  license:
+    name: PolyForm-Noncommercial-1.0.0 OR PolyForm-Small-Business-1.0.0
+    identifier: PolyForm-Noncommercial-1.0.0 OR PolyForm-Small-Business-1.0.0
+servers:
+  - url: http://127.0.0.1:11436
+    description: TCP listener. Read the real port from the discovery file.
+  - url: http://lr
+    description: Unix socket. Any Host value works; the socket path is in the discovery file.
+
+security:
+  - {}
+  - lraKey: []
+
+# x-socket-only: true marks operations that answer only on the Unix socket.
+
+tags:
+  - name: Management
+  - name: Inference
+  - name: Admin
+    description: Internal to Local Router's own window. Unix socket only, checked per connection. May change without notice.
+
+paths:
+  /lr/v1/health:
+    get:
+      tags: [Management]
+      operationId: getHealth
+      summary: Check that Local Router answers. Open to everyone, also without a key.
+      security: [{}]
+      responses:
+        "200":
+          description: Local Router is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /lr/v1/connect:
+    post:
+      tags: [Management]
+      operationId: connect
+      summary: Ask to connect an app. Unix socket only.
+      security: [{}]
+      x-socket-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConnectRequest" }
+      responses:
+        "200":
+          description: Approved (already connected, or an Askantis app that connects automatically).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConnectApproved" }
+        "202":
+          description: Waiting for the user to answer in Local Router.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConnectPending" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/connect/{request_id}:
+    get:
+      tags: [Management]
+      operationId: getConnectRequest
+      summary: Check a pending connect request. Unix socket only, and only for the program that asked.
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Current status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConnectStatus" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/me:
+    get:
+      tags: [Management]
+      operationId: getMe
+      summary: The calling app, its roles and their current bindings.
+      responses:
+        "200":
+          description: The app's record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppRecord" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Management]
+      operationId: disconnect
+      summary: Disconnect the calling app.
+      responses:
+        "204": { description: Disconnected. }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/me/roles:
+    put:
+      tags: [Management]
+      operationId: putRoles
+      summary: Replace the app's role declarations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  items: { $ref: "#/components/schemas/RoleDeclaration" }
+      responses:
+        "200":
+          description: The app's record with the new roles and their bindings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppRecord" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/me/resident:
+    put:
+      tags: [Management]
+      operationId: putResident
+      summary: Report the models the app runs in its own process.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResidentReport" }
+      responses:
+        "204": { description: Recorded. }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/models:
+    get:
+      tags: [Management]
+      operationId: listModels
+      summary: Every model Local Router knows about, from all stores.
+      parameters:
+        - { name: kind, in: query, schema: { $ref: "#/components/schemas/ModelKind" } }
+        - { name: store, in: query, schema: { $ref: "#/components/schemas/Store" } }
+        - { name: state, in: query, schema: { $ref: "#/components/schemas/ModelState" } }
+      responses:
+        "200":
+          description: The inventory.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/Model" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/models/load:
+    post:
+      tags: [Management]
+      operationId: loadModel
+      summary: Ask for a model to be ready. A hold, not a command.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoadRequest" }
+      responses:
+        "200":
+          description: Loaded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Model" }
+        "202":
+          description: Loading continues in the background; watch model.state events.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Model" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/models/unload:
+    post:
+      tags: [Management]
+      operationId: unloadModel
+      summary: Release the app's hold on a model.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: string }
+      responses:
+        "204": { description: Hold released. }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/downloads:
+    get:
+      tags: [Management]
+      operationId: listDownloads
+      summary: The caller's own downloads, running and recent.
+      responses:
+        "200":
+          description: Downloads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [downloads]
+                properties:
+                  downloads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Download" }
+    post:
+      tags: [Management]
+      operationId: startDownload
+      summary: Download a model into its standard place.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DownloadRequest" }
+      responses:
+        "202":
+          description: Started, queued, or already done.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Download" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/downloads/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Management]
+      operationId: getDownload
+      summary: One download.
+      responses:
+        "200":
+          description: The download.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Download" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Management]
+      operationId: cancelDownload
+      summary: Cancel a download the caller started.
+      responses:
+        "204": { description: Cancelled. }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /lr/v1/events:
+    get:
+      tags: [Management]
+      operationId: streamEvents
+      summary: Server-sent events. See PROTOCOL.md, section 10.
+      parameters:
+        - { name: Last-Event-ID, in: header, schema: { type: string } }
+      responses:
+        "200":
+          description: An endless event stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+              x-event-types:
+                - reset
+                - model.added
+                - model.removed
+                - model.state
+                - download.progress
+                - download.done
+                - download.failed
+                - role.bound
+                - role.unbound
+                - connect.updated
+                - unload_requested
+                - memory.pressure
+                - ollama.state
+                - hf_cache.state
+                - activity
+                - shutdown
+
+  /lr/v1/audio/diarizations:
+    post:
+      tags: [Inference]
+      operationId: diarize
+      summary: Separate speakers without transcribing.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, contentMediaType: application/octet-stream }
+                model: { type: string, default: localrouter/diarize }
+                num_speakers: { type: integer, minimum: 1 }
+                min_speakers: { type: integer, minimum: 1 }
+                max_speakers: { type: integer, minimum: 1 }
+                response_format: { enum: [json, rttm], default: json }
+                stream: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Speaker segments, or a text/event-stream when stream is true.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Diarization" }
+            text/plain:
+              schema: { type: string, description: RTTM lines }
+            text/event-stream:
+              schema: { type: string }
+              x-event-types: [diarization.progress, diarization.done, error]
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /v1/models:
+    get:
+      tags: [Inference]
+      operationId: listOpenAIModels
+      summary: Models the caller can use, in OpenAI's format, including localrouter/<role> entries.
+      responses:
+        "200":
+          description: Model list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data]
+                properties:
+                  object: { const: list }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, object]
+                      properties:
+                        id: { type: string }
+                        object: { const: model }
+                        owned_by: { type: string }
+                        created: { type: integer }
+
+  /v1/chat/completions:
+    post:
+      tags: [Inference]
+      operationId: chatCompletions
+      summary: OpenAI chat completions, run on Ollama with Local Router's context and keep-alive rules.
+      description: |
+        Request and response follow the OpenAI API, including streaming. Local Router adds the optional
+        fields `lr_context` (integer) and `lr_keep_alive` (string or integer seconds), and accepts `think` (boolean).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              additionalProperties: true
+              properties:
+                model: { type: string, examples: [localrouter/chapters, "qwen3.5:9b"] }
+                messages: { type: array, items: { type: object } }
+                stream: { type: boolean }
+                lr_context: { type: integer, minimum: 512 }
+                lr_keep_alive: { oneOf: [{ type: string }, { type: integer }], description: "Up to 4h." }
+                think: { type: boolean }
+      responses:
+        "200":
+          description: OpenAI chat completion, or a text/event-stream when stream is true.
+          headers:
+            LR-Resolved-Model: { schema: { type: string } }
+            LR-Context-Length: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { type: object }
+            text/event-stream:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /v1/embeddings:
+    post:
+      tags: [Inference]
+      operationId: embeddings
+      summary: OpenAI embeddings, run on Ollama.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              additionalProperties: true
+              properties:
+                model: { type: string, examples: [localrouter/embed] }
+                input:
+                  oneOf:
+                    - { type: string }
+                    - { type: array, items: { type: string } }
+      responses:
+        "200":
+          description: OpenAI embedding list.
+          headers:
+            LR-Resolved-Model: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { type: object }
+        "409": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+
+  /v1/audio/transcriptions:
+    post:
+      tags: [Inference]
+      operationId: transcribe
+      summary: Speech to text, OpenAI-compatible, with optional speakers.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, model]
+              properties:
+                file: { type: string, contentMediaType: application/octet-stream }
+                model: { type: string, examples: [localrouter/transcribe, whisper-1] }
+                language: { type: string, examples: [de, gsw, en] }
+                prompt: { type: string }
+                response_format: { enum: [json, text, srt, vtt, verbose_json, lr_speakers_json], default: json }
+                "timestamp_granularities[]":
+                  type: array
+                  items: { enum: [segment, word] }
+                temperature: { type: number, default: 0 }
+                stream: { type: boolean, default: false, description: "Only with json, verbose_json and lr_speakers_json." }
+                lr_diarize: { type: boolean }
+                lr_num_speakers: { type: integer, minimum: 1 }
+                lr_min_speakers: { type: integer, minimum: 1 }
+                lr_max_speakers: { type: integer, minimum: 1 }
+                lr_segments:
+                  type: string
+                  contentMediaType: application/json
+                  description: 'JSON array of {"start", "end", "speaker"?} in seconds; times in the answer stay in the whole file''s timeline.'
+                lr_offset: { type: number, description: Seconds added to every time in the answer (live windows). }
+                lr_denoise: { type: boolean, default: false }
+                lr_vad: { type: boolean, default: true }
+                lr_priority: { enum: [live, interactive, batch], default: interactive }
+      responses:
+        "200":
+          description: The transcript in the requested format.
+          headers:
+            LR-Resolved-Model: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [text]
+                    properties: { text: { type: string } }
+                  - $ref: "#/components/schemas/TranscriptionVerbose"
+                  - $ref: "#/components/schemas/TranscriptionSpeakers"
+            text/plain:
+              schema: { type: string }
+            text/event-stream:
+              schema: { type: string }
+              x-event-types: [transcript.text.delta, transcript.text.segment, transcript.text.done, error]
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /api/chat:
+    post:
+      tags: [Inference]
+      operationId: ollamaChat
+      summary: Ollama's chat, with localrouter/<role> resolved, num_ctx filled in and keep_alive limited.
+      responses:
+        "200": { description: "Ollama's answer, streamed unchanged." }
+  /api/generate:
+    post:
+      tags: [Inference]
+      operationId: ollamaGenerate
+      summary: Ollama's generate, with the same rules as /api/chat.
+      responses:
+        "200": { description: "Ollama's answer, streamed unchanged." }
+  /api/embed:
+    post:
+      tags: [Inference]
+      operationId: ollamaEmbed
+      summary: Ollama's embeddings, with localrouter/<role> resolved.
+      responses:
+        "200": { description: "Ollama's answer, unchanged." }
+  /api/embeddings:
+    post:
+      tags: [Inference]
+      operationId: ollamaEmbeddingsLegacy
+      summary: Ollama's older embeddings endpoint, with localrouter/<role> resolved.
+      responses:
+        "200": { description: "Ollama's answer, unchanged." }
+  /api/show:
+    post:
+      tags: [Inference]
+      operationId: ollamaShow
+      responses:
+        "200": { description: "Ollama's answer, unchanged." }
+  /api/tags:
+    get:
+      tags: [Inference]
+      operationId: ollamaTags
+      responses:
+        "200": { description: "Ollama's answer, unchanged." }
+  /api/ps:
+    get:
+      tags: [Inference]
+      operationId: ollamaPs
+      responses:
+        "200": { description: "Ollama's answer, unchanged." }
+  /api/version:
+    get:
+      tags: [Inference]
+      operationId: ollamaVersion
+      responses:
+        "200": { description: "Ollama's answer, unchanged." }
+
+  /api/{path}:
+    parameters:
+      - { name: path, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Inference]
+      operationId: ollamaOtherGet
+      summary: Every other Ollama endpoint is refused.
+      responses:
+        "403": { description: "Not available through Local Router; body in Ollama's shape: {\"error\": \"...\"}" }
+    post:
+      tags: [Inference]
+      operationId: ollamaOtherPost
+      summary: Every other Ollama endpoint (pull, push, create, copy, delete, blobs) is refused.
+      responses:
+        "403": { description: "Not available through Local Router; body in Ollama's shape: {\"error\": \"...\"}" }
+    delete:
+      tags: [Inference]
+      operationId: ollamaOtherDelete
+      summary: Deleting models through Ollama's API is refused.
+      responses:
+        "403": { description: "Not available through Local Router; body in Ollama's shape: {\"error\": \"...\"}" }
+
+  /lr/v1/admin/apps:
+    get:
+      tags: [Admin]
+      operationId: adminListApps
+      security: [{}]
+      x-socket-only: true
+      responses:
+        "200":
+          description: Connected apps and TCP-key apps.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [apps]
+                properties:
+                  apps:
+                    type: array
+                    items: { $ref: "#/components/schemas/AppRecord" }
+
+  /lr/v1/admin/apps/{app_id}:
+    delete:
+      tags: [Admin]
+      operationId: adminRemoveApp
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: app_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Removed. }
+
+  /lr/v1/admin/apps/{app_id}/roles/{role}:
+    put:
+      tags: [Admin]
+      operationId: adminBindAppRole
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: app_id, in: path, required: true, schema: { type: string } }
+        - { name: role, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: ["string", "null"], description: null removes the binding }
+      responses:
+        "204": { description: Bound. }
+
+  /lr/v1/admin/roles/{role}:
+    put:
+      tags: [Admin]
+      operationId: adminBindGlobalRole
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: role, in: path, required: true, schema: { enum: [chat, embed, transcribe, diarize] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: ["string", "null"] }
+      responses:
+        "204": { description: Bound. }
+
+  /lr/v1/admin/connect/{request_id}:
+    post:
+      tags: [Admin]
+      operationId: adminAnswerConnect
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve]
+              properties:
+                approve: { type: boolean }
+      responses:
+        "204": { description: Answered. }
+
+  /lr/v1/admin/keys:
+    get:
+      tags: [Admin]
+      operationId: adminListKeys
+      security: [{}]
+      x-socket-only: true
+      responses:
+        "200":
+          description: Keys (without secrets).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/AccessKey" }
+    post:
+      tags: [Admin]
+      operationId: adminCreateKey
+      security: [{}]
+      x-socket-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: The new key. The secret is shown this once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/AccessKey"
+                  - type: object
+                    required: [secret]
+                    properties:
+                      secret: { type: string, pattern: "^lra_[A-Za-z0-9_-]{43}$" }
+
+  /lr/v1/admin/keys/{id}:
+    delete:
+      tags: [Admin]
+      operationId: adminRevokeKey
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked. }
+
+  /lr/v1/admin/models/{id}:
+    delete:
+      tags: [Admin]
+      operationId: adminDeleteModel
+      summary: Delete a model from its store. Only the user can do this.
+      security: [{}]
+      x-socket-only: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted. }
+
+  /lr/v1/admin/import:
+    post:
+      tags: [Admin]
+      operationId: adminImportGguf
+      summary: Add a GGUF file from the Hugging Face cache to Ollama.
+      security: [{}]
+      x-socket-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: string, examples: ["hf:unsloth/Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"] }
+      responses:
+        "202":
+          description: Import started.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Download" }
+
+  /lr/v1/admin/shutdown:
+    post:
+      tags: [Admin]
+      operationId: adminShutdown
+      security: [{}]
+      x-socket-only: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                restart: { type: boolean, default: false }
+      responses:
+        "202": { description: Shutting down. }
+
+components:
+  securitySchemes:
+    lraKey:
+      type: http
+      scheme: bearer
+      description: An `lra_` key the user created in Local Router. Required on TCP, not used on the Unix socket.
+
+  responses:
+    Error:
+      description: An error. See PROTOCOL.md, section 12.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message]
+          properties:
+            type:
+              enum: [invalid_request_error, authentication_error, permission_error, not_found_error, rate_limit_error, server_error, upstream_error]
+            code:
+              type: string
+              examples: [invalid_request, context_length_exceeded, unauthorized, not_approved, identity_mismatch, forbidden, not_found, role_unbound, model_not_downloaded, context_in_use, conflict, payload_too_large, unsupported_media_type, busy, internal, upstream_unavailable, model_loading, insufficient_memory]
+            message: { type: string }
+            param: { type: ["string", "null"] }
+            details: { type: object, additionalProperties: true }
+
+    Health:
+      type: object
+      required: [protocols, daemon_version, instance_id, capabilities]
+      properties:
+        protocols: { type: array, minItems: 1, items: { type: integer, minimum: 1 } }
+        daemon_version: { type: string }
+        instance_id: { type: string, format: uuid }
+        capabilities: { type: array, items: { type: string } }
+        ollama:
+          type: object
+          properties:
+            state: { enum: [running, stopped, not_installed] }
+            version: { type: ["string", "null"] }
+        hf_cache:
+          type: object
+          properties:
+            path: { type: ["string", "null"] }
+            state: { enum: [ok, missing_volume, unwritable] }
+
+    Store:
+      enum: [ollama, hf, app]
+    ModelKind:
+      enum: [llm, embedding, asr, diarization, vad, denoise, other]
+    ModelState:
+      enum: [available, downloading, loading, loaded, missing]
+    Capability:
+      enum: [chat, embedding, transcription, diarization]
+
+    ModelRef:
+      type: object
+      required: [store, id]
+      properties:
+        store: { enum: [ollama, hf] }
+        id: { type: string, examples: ["qwen3.5:9b", "ggerganov/whisper.cpp"] }
+        file: { type: string, description: For hf models stored as one file in a repository. }
+        revision: { type: string, description: For hf models. Commit hash or branch; default main. }
+
+    RoleDeclaration:
+      type: object
+      required: [role, capability]
+      properties:
+        role: { type: string, pattern: "^[a-z0-9_.-]{1,32}$" }
+        capability: { $ref: "#/components/schemas/Capability" }
+        min_context: { type: integer, minimum: 512 }
+        languages: { type: array, items: { type: string } }
+        suggestions: { type: array, items: { $ref: "#/components/schemas/ModelRef" } }
+        required: { type: boolean, default: true }
+        label: { type: string, maxLength: 40 }
+
+    ConnectRequest:
+      type: object
+      required: [app_id, name, version]
+      properties:
+        app_id: { type: string, pattern: "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$" }
+        name: { type: string, maxLength: 60 }
+        version: { type: string }
+        publisher: { type: string }
+        icon_png: { type: string, contentEncoding: base64, description: "128×128 PNG, at most 64 KB" }
+        reason: { type: string, maxLength: 140 }
+        roles: { type: array, items: { $ref: "#/components/schemas/RoleDeclaration" } }
+
+    ConnectApproved:
+      type: object
+      required: [status, app]
+      properties:
+        status: { const: approved }
+        app: { $ref: "#/components/schemas/AppRecord" }
+
+    ConnectPending:
+      type: object
+      required: [status, request_id, poll]
+      properties:
+        status: { const: pending }
+        request_id: { type: string }
+        poll: { type: string, examples: ["/lr/v1/connect/cr_8a1…"] }
+
+    ConnectStatus:
+      type: object
+      required: [status]
+      properties:
+        status: { enum: [pending, approved, denied, expired] }
+        app: { $ref: "#/components/schemas/AppRecord" }
+
+    RoleBinding:
+      type: object
+      required: [role, capability]
+      properties:
+        role: { type: string }
+        capability: { $ref: "#/components/schemas/Capability" }
+        model: { type: ["string", "null"], description: The model the role resolves to now, or null if unbound. }
+        source: { enum: [app, global, suggestion, none] }
+        label: { type: string }
+        required: { type: boolean }
+
+    AppRecord:
+      type: object
+      required: [app_id, name, trust, roles]
+      properties:
+        app_id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        publisher: { type: string }
+        trust: { enum: [askantis, signed, unsigned, key] }
+        connected_at: { type: string, format: date-time }
+        last_used: { type: ["string", "null"], format: date-time }
+        roles: { type: array, items: { $ref: "#/components/schemas/RoleBinding" } }
+
+    ResidentModel:
+      type: object
+      required: [name, kind, memory_bytes, state]
+      properties:
+        name: { type: string, pattern: "^[a-z0-9_.-]{1,40}$" }
+        kind: { $ref: "#/components/schemas/ModelKind" }
+        display_name: { type: string }
+        memory_bytes: { type: integer, minimum: 0 }
+        state: { enum: [loading, loaded] }
+        device: { enum: [gpu, cpu, ane] }
+        source: { type: string, description: Model id of the weights on disk, if they are in a standard place. }
+
+    ResidentReport:
+      type: object
+      required: [models]
+      properties:
+        models: { type: array, items: { $ref: "#/components/schemas/ResidentModel" } }
+        lease_seconds: { type: integer, minimum: 10, maximum: 3600, default: 60 }
+
+    Model:
+      type: object
+      required: [id, store, kind, display_name, state]
+      properties:
+        id: { type: string }
+        store: { $ref: "#/components/schemas/Store" }
+        kind: { $ref: "#/components/schemas/ModelKind" }
+        display_name: { type: string }
+        maker: { type: string }
+        format: { enum: [gguf, mlx, ggml, safetensors, coreml, onnx, other] }
+        size_bytes: { type: integer }
+        quantization: { type: string }
+        parameters: { type: string }
+        context_length: { type: integer }
+        capabilities: { type: array, items: { type: string } }
+        languages: { type: array, items: { type: string } }
+        state: { $ref: "#/components/schemas/ModelState" }
+        loaded:
+          type: object
+          properties:
+            memory_bytes: { type: integer }
+            context: { type: integer }
+            expires_at: { type: ["string", "null"], format: date-time }
+            held_by_you: { type: boolean }
+            holders: { type: integer, minimum: 0, description: How many apps hold it. Never which ones. }
+        bound_for_you: { type: array, items: { type: string }, description: The caller's roles bound to this model. }
+        in_ollama: { type: boolean }
+
+    LoadRequest:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+        context: { type: integer, minimum: 512 }
+        keep_alive: { oneOf: [{ type: string }, { type: integer }], description: "Default 15m, at most 4h." }
+
+    MirrorFile:
+      type: object
+      required: [path, url, size_bytes, sha256, etag]
+      properties:
+        path: { type: string, pattern: "^(?!(.*/)?\\.\\.?(/|$))[^/\\\\:\\x00-\\x1f]+(/[^/\\\\:\\x00-\\x1f]+)*$", description: "Relative; no empty, '.' or '..' parts (PROTOCOL.md 8.1)." }
+        url: { type: string, format: uri, pattern: "^https://" }
+        size_bytes: { type: integer, minimum: 0 }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        etag: { type: string, pattern: "^([0-9a-f]{40}|[0-9a-f]{64})$", description: "The file's HF etag: its SHA-256 for LFS files, its git blob hash otherwise." }
+
+    DownloadRequest:
+      type: object
+      required: [model, source]
+      properties:
+        model: { $ref: "#/components/schemas/ModelRef" }
+        source: { enum: [ollama, hf, mirror] }
+        token: { type: string, description: Hugging Face token for gated repositories. Used once, never stored. }
+        mirror:
+          type: object
+          required: [revision, files]
+          properties:
+            revision: { type: string, pattern: "^[0-9a-f]{40}$" }
+            files: { type: array, minItems: 1, items: { $ref: "#/components/schemas/MirrorFile" } }
+
+    Download:
+      type: object
+      required: [id, model, source, state, bytes_done]
+      properties:
+        id: { type: string }
+        model: { type: string }
+        source: { enum: [ollama, hf, mirror, import] }
+        state: { enum: [queued, running, verifying, done, failed, cancelled] }
+        bytes_done: { type: integer }
+        bytes_total: { type: ["integer", "null"] }
+        started_by_you: { type: boolean }
+        error: { $ref: "#/components/schemas/Error" }
+
+    Word:
+      type: object
+      required: [word, start, end]
+      properties:
+        word: { type: string }
+        start: { type: number }
+        end: { type: number }
+        probability: { type: number }
+
+    TranscriptionSegment:
+      type: object
+      required: [id, start, end, text]
+      properties:
+        id: { type: integer }
+        start: { type: number }
+        end: { type: number }
+        text: { type: string }
+        avg_logprob: { type: number }
+        no_speech_prob: { type: number }
+        speaker: { type: string }
+        words: { type: array, items: { $ref: "#/components/schemas/Word" } }
+
+    TranscriptionVerbose:
+      type: object
+      required: [task, language, duration, text, segments]
+      properties:
+        task: { const: transcribe }
+        language: { type: string }
+        duration: { type: number }
+        text: { type: string }
+        segments: { type: array, items: { $ref: "#/components/schemas/TranscriptionSegment" } }
+        words: { type: array, items: { $ref: "#/components/schemas/Word" } }
+
+    Speaker:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, pattern: "^S[0-9]+$" }
+
+    Overlap:
+      type: object
+      required: [start, end, speakers]
+      properties:
+        start: { type: number }
+        end: { type: number }
+        speakers: { type: array, items: { type: string } }
+
+    TranscriptionSpeakers:
+      allOf:
+        - $ref: "#/components/schemas/TranscriptionVerbose"
+        - type: object
+          required: [speakers]
+          properties:
+            speakers: { type: array, items: { $ref: "#/components/schemas/Speaker" } }
+            overlaps: { type: array, items: { $ref: "#/components/schemas/Overlap" } }
+
+    Diarization:
+      type: object
+      required: [duration, speakers, segments]
+      properties:
+        duration: { type: number }
+        speakers: { type: array, items: { $ref: "#/components/schemas/Speaker" } }
+        segments:
+          type: array
+          items:
+            type: object
+            required: [start, end, speaker]
+            properties:
+              start: { type: number }
+              end: { type: number }
+              speaker: { type: string }
+        overlaps: { type: array, items: { $ref: "#/components/schemas/Overlap" } }
+
+    AccessKey:
+      type: object
+      required: [id, name, created]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created: { type: string, format: date-time }
+        last_used: { type: ["string", "null"], format: date-time }

@@ -1,0 +1,10 @@
+{
+  "task": "transcribe", "language": "de", "duration": 12.48,
+  "text": "Hoi Thomas, wie gaht's?",
+  "segments": [ { "id": 0, "start": 0.32, "end": 2.10, "text": "Hoi Thomas, wie gaht's?",
+                  "avg_logprob": -0.21, "no_speech_prob": 0.01,
+                  "words": [ { "word": "Hoi", "start": 0.32, "end": 0.58, "probability": 0.97 },
+                             { "word": "Thomas,", "start": 0.58, "end": 1.02, "probability": 0.95 } ] } ],
+  "words": [ { "word": "Hoi", "start": 0.32, "end": 0.58, "probability": 0.97 },
+             { "word": "Thomas,", "start": 0.58, "end": 1.02, "probability": 0.95 } ]
+}

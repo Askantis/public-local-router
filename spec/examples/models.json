@@ -1,0 +1,67 @@
+{
+  "models": [
+    {
+      "id": "qwen3.5:9b",
+      "store": "ollama",
+      "kind": "llm",
+      "display_name": "Qwen 3.5 9B",
+      "maker": "Qwen",
+      "format": "gguf",
+      "size_bytes": 6600000000,
+      "quantization": "q4_K_M",
+      "parameters": "9B",
+      "context_length": 262144,
+      "capabilities": [
+        "chat",
+        "tools",
+        "thinking"
+      ],
+      "state": "loaded",
+      "loaded": {
+        "memory_bytes": 9100000000,
+        "context": 32768,
+        "expires_at": null,
+        "held_by_you": true,
+        "holders": 1
+      },
+      "bound_for_you": [
+        "chapters"
+      ]
+    },
+    {
+      "id": "hf:ggerganov/whisper.cpp/ggml-large-v3-turbo-q8_0.bin",
+      "store": "hf",
+      "kind": "asr",
+      "display_name": "Whisper Large v3 Turbo",
+      "maker": "openai",
+      "format": "ggml",
+      "size_bytes": 874000000,
+      "quantization": "q8_0",
+      "capabilities": [
+        "transcription"
+      ],
+      "languages": [
+        "de",
+        "en",
+        "fr",
+        "it"
+      ],
+      "state": "available",
+      "bound_for_you": [
+        "transcribe"
+      ]
+    },
+    {
+      "id": "app:app.askantis.scribely/whisper",
+      "store": "app",
+      "kind": "asr",
+      "display_name": "Whisper Large v3 Turbo",
+      "state": "loaded",
+      "loaded": {
+        "memory_bytes": 1650000000,
+        "held_by_you": true,
+        "holders": 1
+      }
+    }
+  ]
+}

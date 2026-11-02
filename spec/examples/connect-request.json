@@ -1,0 +1,15 @@
+{
+  "app_id": "app.askantis.scribely",
+  "name": "Scribely",
+  "version": "2.0.0",
+  "publisher": "Askantis",
+  "reason": "Transcribe recordings and write chapters",
+  "roles": [
+    { "role": "transcribe", "capability": "transcription", "languages": ["gsw", "de", "en", "fr", "it"],
+      "suggestions": [{ "store": "hf", "id": "ggerganov/whisper.cpp", "file": "ggml-large-v3-turbo-q8_0.bin" }] },
+    { "role": "diarize", "capability": "diarization",
+      "suggestions": [{ "store": "hf", "id": "avencera/speakrs-models" }] },
+    { "role": "chapters", "capability": "chat", "min_context": 32768, "languages": ["de"], "required": false,
+      "label": "Chapters" }
+  ]
+}

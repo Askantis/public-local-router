@@ -1,0 +1,13 @@
+{
+  "model": { "store": "hf", "id": "askantis/gruezi-v1" },
+  "source": "mirror",
+  "mirror": {
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "files": [
+      { "path": "ggml-model-q8_0.bin", "url": "https://example.blob.core.windows.net/models/blobs/abc?sig=REDACTED",
+        "size_bytes": 874000000,
+        "sha256": "22ce7e2cc184e4b6172d163bc1ccd3f6aef99b89236a7eb5e234cd77d1169b82",
+        "etag": "22ce7e2cc184e4b6172d163bc1ccd3f6aef99b89236a7eb5e234cd77d1169b82" }
+    ]
+  }
+}

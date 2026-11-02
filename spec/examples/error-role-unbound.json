@@ -1,0 +1,3 @@
+{ "error": { "type": "invalid_request_error", "code": "role_unbound",
+             "message": "No model is chosen for “chapters”.", "param": null,
+             "details": { "role": "chapters", "link": "localrouter://apps?app=app.askantis.scribely&role=chapters" } } }
