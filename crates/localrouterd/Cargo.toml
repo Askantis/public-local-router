@@ -33,6 +33,8 @@ localrouter-speech.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+localrouter-client = { workspace = true, features = ["embedded"] }
+localrouter-speech.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true

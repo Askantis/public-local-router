@@ -1,0 +1,30 @@
+[package]
+name = "localrouter-client"
+description = "Connect an app to Local Router with one click, and run speech the same way with or without it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Run the speech engine inside the app when Local Router isn't there.
+embedded = ["dep:localrouter-speech", "dep:localrouter-audio", "dep:localrouter-hf"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+localrouter-core.workspace = true
+localrouter-speech = { workspace = true, optional = true }
+localrouter-audio = { workspace = true, optional = true }
+localrouter-hf = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

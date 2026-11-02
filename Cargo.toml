@@ -15,6 +15,7 @@ localrouter-audio = { path = "crates/localrouter-audio" }
 localrouter-speech = { path = "crates/localrouter-speech" }
 localrouter-core = { path = "crates/localrouter-core" }
 localrouter-identity = { path = "crates/localrouter-identity" }
+localrouter-client = { path = "crates/localrouter-client" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +32,7 @@ nnnoiseless = "0.5.2"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "sync", "time", "io-util"] }
 axum = { version = "0.8.9", features = ["multipart", "macros"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = { version = "1.29", features = ["v4", "serde"] }
