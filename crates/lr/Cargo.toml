@@ -1,0 +1,17 @@
+[package]
+name = "lr"
+description = "Local Router command line: transcribe, list models, run benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+localrouter-hf.workspace = true
+localrouter-audio.workspace = true
+localrouter-speech.workspace = true

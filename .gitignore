@@ -12,3 +12,9 @@ notes/
 
 # macOS
 .DS_Store
+
+# Rust
+/target
+
+# Benchmark output
+/bench/out/

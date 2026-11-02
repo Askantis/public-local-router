@@ -1,0 +1,13 @@
+[package]
+name = "localrouter-audio"
+description = "Decode any common audio file to 16 kHz mono f32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+symphonia.workspace = true
+rubato.workspace = true
