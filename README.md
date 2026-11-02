@@ -162,6 +162,8 @@ No. Ollama downloads and runs the models. Local Router is a companion for it.
 
 Local Router is heading towards being a local, private router in the spirit of OpenRouter: one endpoint on your Mac that sends each request to the right local model. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
+The next step is a background service that other apps connect to with one click, for language models and for speech. Its protocol is drafted in [spec/](spec/README.md).
+
 ## Contributing
 
 Issues and pull requests are welcome. For bigger changes, open an issue first so we can talk it through. Releases are built by GitHub Actions; see [docs/RELEASING.md](docs/RELEASING.md).

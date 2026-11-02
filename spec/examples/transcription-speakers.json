@@ -1,0 +1,8 @@
+{
+  "task": "transcribe", "language": "de", "duration": 12.48, "text": "Hoi Thomas, wie gaht's? Guet, merci.",
+  "speakers": [ { "id": "S1" }, { "id": "S2" } ],
+  "segments": [ { "id": 0, "start": 0.32, "end": 2.10, "speaker": "S1", "text": "Hoi Thomas, wie gaht's?",
+                  "words": [ { "word": "Hoi", "start": 0.32, "end": 0.58, "probability": 0.97 } ] },
+                { "id": 1, "start": 2.40, "end": 3.55, "speaker": "S2", "text": "Guet, merci." } ],
+  "overlaps": [ { "start": 2.30, "end": 2.45, "speakers": ["S1", "S2"] } ]
+}

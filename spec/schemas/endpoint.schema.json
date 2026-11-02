@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Askantis/public-local-router/spec/schemas/endpoint.schema.json",
+  "title": "Local Router discovery file (endpoint.json)",
+  "description": "Written by localrouterd when it is ready to answer requests. See PROTOCOL.md, section 4.",
+  "type": "object",
+  "required": [
+    "protocols",
+    "daemon_version",
+    "instance_id",
+    "pid",
+    "started_at",
+    "http",
+    "socket",
+    "hf_cache",
+    "ollama",
+    "capabilities"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "protocols": {
+      "description": "Protocol versions this instance speaks. This schema describes version 1.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "daemon_version": {
+      "description": "Version of localrouterd (semantic versioning).",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([-+].*)?$"
+    },
+    "instance_id": {
+      "description": "New for every start of localrouterd. Clients compare it with GET /lr/v1/health.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "pid": {
+      "description": "Process id of localrouterd. Informational: never use it for trust decisions.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "started_at": {
+      "description": "When this instance started, RFC 3339.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "http": {
+      "description": "Base URL of the TCP listener. Always a loopback address.",
+      "type": "string",
+      "pattern": "^http://(127\\.0\\.0\\.1|\\[::1\\]):(1143[6-9]|1144[0-5])$"
+    },
+    "socket": {
+      "description": "Absolute path of the Unix socket (or the named pipe on Windows), or null if there is none.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hf_cache": {
+      "description": "The Hugging Face cache localrouterd resolved (PROTOCOL.md, section 2).",
+      "type": "object",
+      "required": [
+        "path",
+        "state"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "enum": [
+            "ok",
+            "missing_volume",
+            "unwritable"
+          ]
+        }
+      }
+    },
+    "ollama": {
+      "type": "object",
+      "required": [
+        "url",
+        "state"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "running",
+            "stopped",
+            "not_installed"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "capabilities": {
+      "description": "Optional features this instance supports. Clients ignore names they don't know.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "examples": [
+          "connect",
+          "roles",
+          "resident",
+          "downloads",
+          "events",
+          "audio.transcriptions",
+          "audio.diarizations",
+          "chat",
+          "embeddings",
+          "ollama.passthrough"
+        ]
+      }
+    }
+  }
+}

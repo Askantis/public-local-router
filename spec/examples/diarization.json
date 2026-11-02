@@ -1,0 +1,6 @@
+{
+  "duration": 3600.0,
+  "speakers": [ { "id": "S1" }, { "id": "S2" } ],
+  "segments": [ { "start": 0.32, "end": 4.75, "speaker": "S1" }, { "start": 4.90, "end": 9.10, "speaker": "S2" } ],
+  "overlaps": [ { "start": 5.10, "end": 5.60, "speakers": ["S1", "S2"] } ]
+}
