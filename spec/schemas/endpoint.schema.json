@@ -79,7 +79,8 @@
           "enum": [
             "ok",
             "missing_volume",
-            "unwritable"
+            "unwritable",
+            "checking"
           ]
         }
       }

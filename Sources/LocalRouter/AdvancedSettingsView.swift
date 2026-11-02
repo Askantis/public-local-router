@@ -120,7 +120,7 @@ struct AdvancedSettingsView: View {
     }
 }
 
-private struct Footnote: View {
+struct Footnote: View {
     let text: String
     init(_ text: String) { self.text = text }
 

@@ -121,8 +121,9 @@ mod launch_services {
 pub async fn start() -> Result<Client> {
     #[cfg(target_os = "macos")]
     {
+        // Launching the app (in the background) makes sure its service runs.
         let ok = std::process::Command::new("/usr/bin/open")
-            .args(["-g", "localrouter://start"])
+            .args(["-g", "-b", localrouter_core::BUNDLE_ID])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);

@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -39,7 +40,7 @@ struct LocalRouterApp: App {
                 .environment(store)
         }
         .defaultSize(width: 780, height: 620)
-        .handlesExternalEvents(matching: ["settings", "advanced"])
+        .handlesExternalEvents(matching: ["settings", "advanced", "apps"])
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
@@ -85,10 +86,27 @@ struct LocalRouterApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // `LocalRouter --unregister-service` removes the background service and
+        // quits: for uninstalling, and for tests.
+        if CommandLine.arguments.contains("--unregister-service") {
+            Task {
+                try? await SMAppService.agent(plistName: DaemonStore.plistName).unregister()
+                exit(0)
+            }
+            return
+        }
         // No Dock icon, also when run with `swift run` outside the app bundle.
         NSApp.setActivationPolicy(.accessory)
         NotificationIDs.register()
         UNUserNotificationCenter.current().delegate = self
+        // Apps on this Mac reach the models through the background service.
+        DaemonStore.shared.start()
+    }
+
+    /// Opened again (for example by an app with `open -g -b`): make sure the service runs.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        DaemonStore.shared.ensureRegistered()
+        return true
     }
 
     /// Show notifications even while the menu is open.

@@ -20,7 +20,19 @@ async fn discovery_health_and_web_page_protection() {
     assert_eq!(ep["protocols"], json!([1]));
     assert_eq!(ep["http"], json!(format!("http://127.0.0.1:{}", d.port)));
     assert_eq!(ep["ollama"]["state"], "running");
-    assert_eq!(ep["hf_cache"]["state"], "ok");
+    // The cache is checked after start-up (a removable drive can wait for the user's permission).
+    let t0 = Instant::now();
+    loop {
+        let state = d.sock("GET", "/lr/v1/health", None).await.json()["hf_cache"]["state"].clone();
+        if state == "ok" {
+            break;
+        }
+        assert_eq!(state, "checking");
+        assert!(t0.elapsed() < Duration::from_secs(5), "cache check didn't finish");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ep: Value = serde_json::from_slice(&std::fs::read(d.dir.path().join("endpoint.json")).unwrap()).unwrap();
+    assert_eq!(ep["hf_cache"]["state"], "ok", "the discovery file is updated too");
     assert!(std::fs::metadata(d.socket()).is_ok());
 
     let h = d.sock("GET", "/lr/v1/health", None).await;

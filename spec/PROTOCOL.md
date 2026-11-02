@@ -150,7 +150,7 @@ It writes to a temporary file in the same folder and renames it into place, so r
 }
 ```
 
-`protocols` lists every protocol version the service speaks (section 13). `hf_cache.state` is `ok`, `missing_volume` (the cache is on a drive that isn't connected) or `unwritable`. `ollama.state` is `running`, `stopped` or `not_installed`.
+`protocols` lists every protocol version the service speaks (section 13). `hf_cache.state` is `ok`, `missing_volume` (the cache is on a drive that isn't connected), `unwritable`, or `checking` while the service is still finding out. Checking can take a while: macOS asks the user before a background process reads a removable drive. The `hf_cache.state` event announces the result. `ollama.state` is `running`, `stopped` or `not_installed`.
 
 The file can be stale after a crash. A client MUST confirm with `GET /lr/v1/health` that the service answers and that `instance_id` matches before relying on it.
 
@@ -161,7 +161,7 @@ A client works out one of four states and acts on it:
 | State | How to tell | What the app does |
 |---|---|---|
 | `running` | Discovery file present and `/lr/v1/health` answers with the same `instance_id` | Use it (connect if not connected yet) |
-| `installed` | No working discovery file, but Local Router is installed. On macOS: Launch Services knows the bundle id `ch.askantis.localrouter` | Offer "Start Local Router". To start it, open `localrouter://start`, which starts the service without opening a window, then wait up to 10 seconds for the discovery file |
+| `installed` | No working discovery file, but Local Router is installed. On macOS: Launch Services knows the bundle id `ch.askantis.localrouter` | Offer "Start Local Router". To start it, launch the app in the background (`open -g -b ch.askantis.localrouter`), which starts the service without opening a window, then wait up to 10 seconds for the discovery file |
 | `not_installed` | Neither | Offer "Get Local Router" once, linking to `https://github.com/Askantis/public-local-router/releases/latest`, and carry on without it |
 | `unreachable` | Discovery file present but no answer after a start attempt | Carry on without it and offer to try again |
 
@@ -688,7 +688,7 @@ A library that implements the client side, such as the Rust crate `localrouter-c
 
 - **macOS.**
   - `localrouterd` is a launch agent inside `Local Router.app`. The app registers it with `SMAppService`, and it keeps running when the menu-bar app is closed.
-  - The `localrouter://start` link starts it. The bundle identifier of Local Router is `ch.askantis.localrouter`.
+  - Launching the app in the background (`open -g -b ch.askantis.localrouter`) starts it. The bundle identifier of Local Router is `ch.askantis.localrouter`.
   - Sandboxed apps (for example from the Mac App Store) can't reach the socket, the discovery file or the Hugging Face cache, so version 1 doesn't support them.
 - **Windows** (planned). TCP listener as on macOS. A named pipe `\\.\pipe\localrouter` replaces the Unix socket; the caller is identified with `GetNamedPipeClientProcessId` and its Authenticode signature. Discovery file in `%LOCALAPPDATA%\Askantis\Local Router\`. The Hugging Face cache is `%USERPROFILE%\.cache\huggingface\hub` unless the variables in section 2 say otherwise.
 - **Linux** (not planned yet). Unix socket in `$XDG_RUNTIME_DIR/localrouter/`, caller identified with `SO_PEERCRED`. Without code signatures, every app needs the user's approval.

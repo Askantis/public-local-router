@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Settings pages, in the order the sidebar shows them.
 enum SettingsPane: String, CaseIterable, Identifiable {
-    case general, menuBar, models, schedule, storage, ollama, sharing, advanced, credits
+    case general, menuBar, models, schedule, storage, ollama, apps, sharing, advanced, credits
 
     var id: String { rawValue }
 
@@ -15,6 +15,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .schedule: "Schedule"
         case .storage: "Models Folder"
         case .ollama: "Ollama"
+        case .apps: "Apps"
         case .sharing: "Sharing"
         case .advanced: "Advanced"
         case .credits: "Credits"
@@ -29,6 +30,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .schedule: "calendar.badge.clock"
         case .storage: "externaldrive.fill"
         case .ollama: "server.rack"
+        case .apps: "app.connected.to.app.below.fill"
         case .sharing: "network.badge.shield.half.filled"
         case .advanced: "slider.horizontal.3"
         case .credits: "heart.fill"
@@ -44,6 +46,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .schedule: ["time", "days", "hours", "weekday", "keep loaded"]
         case .storage: ["folder", "disk", "drive", "external", "move", "symlink", "location"]
         case .ollama: ["address", "host", "port", "connection", "find", "status"]
+        case .apps: ["apps", "connect", "connected", "scribely", "allow", "key", "service", "background", "daemon"]
         case .sharing: ["network", "share", "key", "token", "api", "auth", "password", "expose", "lan", "remote"]
         case .advanced: ["context", "length", "memory saver", "kv", "cache", "flash", "attention", "parallel", "loaded at once", "unload"]
         case .credits: ["about", "version", "license", "askantis", "author", "thanks", "privacy"]
@@ -58,6 +61,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .schedule: .red
         case .storage: .orange
         case .ollama: .green
+        case .apps: .cyan
         case .sharing: .teal
         case .advanced: .purple
         case .credits: .pink
@@ -114,6 +118,7 @@ struct SettingsView: View {
                 case .schedule: SchedulePane()
                 case .storage: StoragePane()
                 case .ollama: OllamaPane()
+                case .apps: AppsPane()
                 case .sharing: SharingPane()
                 case .advanced: AdvancedSettingsView()
                 case .credits: CreditsPane()
@@ -127,6 +132,7 @@ struct SettingsView: View {
         .background(BringToFront())
         .onOpenURL { url in
             if url.host == "advanced" { pane = .advanced }
+            if url.host == "apps" { pane = .apps }
         }
     }
 }

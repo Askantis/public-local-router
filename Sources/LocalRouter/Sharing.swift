@@ -359,7 +359,7 @@ struct SharingPane: View {
 }
 
 /// Text with a copy button.
-private struct CopyableText: View {
+struct CopyableText: View {
     let text: String
     @State private var copied = false
 
