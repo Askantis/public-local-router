@@ -13,6 +13,8 @@ rust-version = "1.89"
 localrouter-hf = { path = "crates/localrouter-hf" }
 localrouter-audio = { path = "crates/localrouter-audio" }
 localrouter-speech = { path = "crates/localrouter-speech" }
+localrouter-core = { path = "crates/localrouter-core" }
+localrouter-identity = { path = "crates/localrouter-identity" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +29,20 @@ whisper-rs = { version = "0.16.0", features = ["metal"] }
 speakrs = { version = "0.7.0", default-features = false, features = ["coreml", "cpu"] }
 nnnoiseless = "0.5.2"
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "sync", "time", "io-util"] }
+axum = { version = "0.8.9", features = ["multipart", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { version = "1.29", features = ["v4", "serde"] }
+libc = "0.2"
+core-foundation = "0.10"
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+rand = "0.9"
+time = { version = "0.3", features = ["formatting", "serde"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [profile.release]
 debug = 1
