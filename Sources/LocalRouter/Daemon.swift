@@ -236,29 +236,57 @@ final class DaemonStore {
 
     func ensureRegistered() {
         guard bundled else { return }
+        serviceStatus = service.status
+        Task { await register() }
+    }
+
+    /// Register the service, or register it again when launchd won't start
+    /// it: launchd pins a registration to the code it was made for, so after
+    /// an update (or a new build) the old registration fails with EX_CONFIG.
+    /// Each step waits for the one before; launchd needs a moment to forget
+    /// a registration, and registering again too early keeps the old one.
+    private func register() async {
         if service.status != .enabled {
             do { try service.register() } catch { lastError = error.localizedDescription }
+            serviceStatus = service.status
+            return  // RunAtLoad starts it
         }
+        if await Self.alive() {
+            guard runningCopyIsOlder() else { return }
+            // The copy from before an update: stop it so the new one runs.
+            _ = try? await background { try UnixHTTP.request("POST", "/lr/v1/admin/shutdown") }
+            await Self.waitUntil(seconds: 5) { !(await Self.alive()) }
+        }
+        try? await service.unregister()
+        await Self.waitUntil(seconds: 10) { !(await Self.jobLoaded()) }
+        try? await Task.sleep(for: .seconds(1))
+        do { try service.register() } catch { lastError = error.localizedDescription }
         serviceStatus = service.status
-        // Registered but not running: it was stopped or quit cleanly, or the
-        // app was replaced (an update, a new build) and launchd won't start the
-        // old registration. Register again for this copy, then start it.
-        if serviceStatus == .enabled {
-            Task {
-                if await Self.alive() {
-                    // Still the copy from before an update: restart it so the
-                    // new one runs. A clean exit isn't restarted by launchd.
-                    guard runningCopyIsOlder() else { return }
-                    _ = try? await background { try UnixHTTP.request("POST", "/lr/v1/admin/shutdown") }
-                    try? await Task.sleep(for: .seconds(1))
-                }
-                try? await service.unregister()
-                do { try service.register() } catch { lastError = error.localizedDescription }
-                serviceStatus = service.status
-                try? await Task.sleep(for: .seconds(1))
-                if !(await Self.alive()) { Self.kickstart() }
-            }
+        if !(await Self.waitUntil(seconds: 10) { await Self.alive() }) { Self.kickstart() }
+    }
+
+    /// Whether launchd still has the service's job.
+    private static func jobLoaded() async -> Bool {
+        (try? await background {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            p.arguments = ["print", "gui/\(getuid())/ch.askantis.localrouter.daemon"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus == 0
+        }) ?? false
+    }
+
+    @discardableResult
+    private static func waitUntil(seconds: Double, _ check: () async -> Bool) async -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            if await check() { return true }
+            try? await Task.sleep(for: .milliseconds(250))
         }
+        return await check()
     }
 
     /// The bundled service binary changed after the running service started.
