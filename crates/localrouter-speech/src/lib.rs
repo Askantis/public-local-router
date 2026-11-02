@@ -53,6 +53,9 @@ pub struct Transcript {
 /// Progress of [`transcribe`]: `(steps done, steps total)`.
 pub type Progress<'a> = &'a mut dyn FnMut(usize, usize);
 
+/// Receives each turn as soon as it's final, in order.
+pub type TurnSink<'a> = &'a mut dyn FnMut(&TranscriptTurn);
+
 /// How speech is cut up for Whisper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
@@ -104,10 +107,28 @@ pub fn transcribe_turns(
     strategy: Strategy,
     progress: Progress<'_>,
 ) -> Result<Transcript> {
+    transcribe_turns_streaming(audio, asr, speaker_turns, opts, strategy, progress, &mut |_| {})
+}
+
+/// [`transcribe_turns`] that hands every turn to `sink` once it's final.
+/// Without speakers that is after each window; with [`Strategy::Windows`]
+/// a speaker's turn can continue into the next window, so turns come at
+/// the end.
+pub fn transcribe_turns_streaming(
+    audio: &Audio,
+    asr: &Asr,
+    speaker_turns: Option<Vec<Turn>>,
+    opts: &AsrOptions,
+    strategy: Strategy,
+    progress: Progress<'_>,
+    sink: TurnSink<'_>,
+) -> Result<Transcript> {
     let duration = audio.duration_s();
     if strategy == Strategy::Windows
         && let Some(turns) = speaker_turns {
-            return transcribe_windows(audio, asr, &turns, opts, progress);
+            let t = transcribe_windows(audio, asr, &turns, opts, progress)?;
+            t.turns.iter().for_each(&mut *sink);
+            return Ok(t);
         }
     let diarized = speaker_turns.is_some();
     let turns = match speaker_turns {
@@ -135,6 +156,7 @@ pub fn transcribe_turns(
                 let words: Vec<Word> = s.words.into_iter().filter(|w| w.start >= from).collect();
                 let text = if words.is_empty() { s.text.trim().to_string() } else { join_text(words.iter().map(|w| w.word.as_str())) };
                 out.push(TranscriptTurn { start: s.start.max(from), end: s.end, speaker: turn.speaker.clone(), text, words });
+                sink(out.last().unwrap());
             }
             continue;
         }
@@ -144,6 +166,7 @@ pub fn transcribe_turns(
         }
         let words = segments.into_iter().flat_map(|s| s.words).collect();
         out.push(TranscriptTurn { start: turn.start, end: turn.end, speaker: turn.speaker.clone(), text, words });
+        sink(out.last().unwrap());
     }
     progress(total, total);
     let mut speakers: Vec<String> = Vec::new();

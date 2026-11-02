@@ -12,7 +12,9 @@
 #![allow(clippy::result_large_err)]
 
 mod app;
+mod downloads;
 mod events;
+mod holds;
 mod ollama;
 mod speech;
 mod state;
@@ -58,6 +60,8 @@ async fn main() -> Result<()> {
         hf: RwLock::new(HfCacheInfo { path: Some(hub.display().to_string()), state: "checking".into() }),
         ollama_state: RwLock::new(OllamaInfo { url: ollama_url, state: "stopped".into(), version: None }),
         resident: Mutex::new(Default::default()),
+        downloads: downloads::Downloads::new(),
+        holds: holds::Holds::default(),
         shutdown: tokio::sync::Notify::new(),
     });
     refresh_ollama(&st).await;
@@ -118,6 +122,9 @@ async fn main() -> Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 refresh_ollama(&st).await;
+                for model in st.holds.expire() {
+                    app::release(&st, &model).await;
+                }
             }
         }
     });

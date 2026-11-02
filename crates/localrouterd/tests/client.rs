@@ -48,6 +48,19 @@ async fn an_app_connects_and_uses_its_roles() {
     let err = client.transcribe(b"RIFF".to_vec(), "x.wav", &TranscribeOptions::default()).await.unwrap_err();
     assert_eq!(err.code(), Some("role_unbound"), "{err}");
 
+    // Downloads and holds.
+    let d = client.download(&json!({ "model": { "store": "ollama", "id": "new:3b" }, "source": "ollama" })).await.unwrap();
+    let mut seen = 0;
+    let d = client.wait_download(d, |_| seen += 1).await.unwrap();
+    assert_eq!(d.state, "done");
+    assert_eq!(d.fraction(), Some(1.0));
+    assert!(seen >= 1);
+    let failed = client.download(&json!({ "model": { "store": "ollama", "id": "missing:7b" }, "source": "ollama" })).await.unwrap();
+    assert!(client.wait_download(failed, |_| {}).await.unwrap_err().to_string().contains("does not exist"));
+    let held = client.hold("localrouter/chapters", None, Some("5m")).await.unwrap();
+    assert_eq!(held["context"], 32768);
+    client.release("localrouter/chapters").await.unwrap();
+
     let ai = LocalAi::Connected(client.clone());
     assert!(ai.is_connected());
 
@@ -70,4 +83,40 @@ async fn embedded_and_connected_agree() {
     assert!(embedded.text.contains("Guten Morgen"), "{}", embedded.text);
     assert!(embedded.segments.iter().all(|s| s.speaker.is_none()));
     assert!(embedded.segments.iter().flat_map(|s| &s.words).count() >= 30);
+}
+
+/// Streaming through the service with the real speech models, segment by
+/// segment. Needs `lr fetch` and `bench/synth.py bench/out`.
+/// Run: `cargo test -p localrouterd --features test-admin --release -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn segments_stream_in_as_they_finish() {
+    let d = start_real_cache().await;
+    let Presence::Running(client) = discover_in(d.dir.path()).await else { panic!("Local Router should be running") };
+    let manifest: localrouter_client::ConnectRequest = serde_json::from_value(scribely_manifest()).unwrap();
+    let approve = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rid = d.sock("POST", "/lr/v1/connect", Some(scribely_manifest())).await.json()["request_id"].as_str().unwrap().to_string();
+        d.sock("POST", &format!("/lr/v1/admin/connect/{rid}"), Some(json!({ "approve": true }))).await;
+    };
+    let (app, ()) = tokio::join!(client.connect(&manifest, None), approve);
+    app.unwrap();
+    let t0 = std::time::Instant::now();
+    while d.sock("GET", "/lr/v1/health", None).await.json()["hf_cache"]["state"] != "ok" {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "cache never ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/out/words.wav");
+    let opts = TranscribeOptions {
+        model: Some(localrouter_speech::catalog::whisper_model_id(&localrouter_speech::catalog::WHISPER_TURBO_Q8)),
+        language: Some("de".into()),
+        ..Default::default()
+    };
+    let mut streamed = vec![];
+    let t = client.transcribe_streaming(std::fs::read(wav).unwrap(), "words.wav", &opts, |s| streamed.push(s)).await.unwrap();
+    assert!(streamed.len() >= 2, "{streamed:?}");
+    assert_eq!(streamed.len(), t.segments.len());
+    assert_eq!(streamed[0].text, t.segments[0].text);
+    assert!(t.text.contains("Guten Morgen"), "{}", t.text);
+    assert!(t.segments.iter().flat_map(|s| &s.words).count() >= 30);
 }

@@ -175,6 +175,98 @@ impl Ollama {
         };
         r.await.map(|p| p.models).unwrap_or_default()
     }
+
+    /// Load `model`, or reset its unload timer: `keep_alive` seconds, or
+    /// Ollama's own idle time when `None`. Pass the loaded context: another
+    /// `num_ctx` makes Ollama load the model again.
+    pub async fn hold(&self, model: &str, keep_alive: Option<u64>, num_ctx: Option<u32>, embedding: bool) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({ "model": model });
+        if let Some(k) = keep_alive {
+            body["keep_alive"] = serde_json::json!(k);
+        }
+        if let Some(c) = num_ctx {
+            body["options"] = serde_json::json!({ "num_ctx": c });
+        }
+        // Embedding models can't generate, so they're loaded through /api/embed.
+        let path = if embedding {
+            body["input"] = serde_json::json!("");
+            "/api/embed"
+        } else {
+            body["prompt"] = serde_json::json!("");
+            body["stream"] = serde_json::json!(false);
+            "/api/generate"
+        };
+        self.http
+            .post(format!("{}{path}", self.base))
+            .json(&body)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// `ollama pull`, with progress summed over the model's layers. Stops when
+    /// `cancel` is set (closing the request stops Ollama's pull too).
+    pub async fn pull(
+        &self,
+        name: &str,
+        mut progress: impl FnMut(u64, Option<u64>),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<()> {
+        use futures::StreamExt;
+        #[derive(Deserialize)]
+        struct Line {
+            #[serde(default)]
+            status: String,
+            #[serde(default)]
+            digest: Option<String>,
+            #[serde(default)]
+            total: Option<u64>,
+            #[serde(default)]
+            completed: Option<u64>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/pull", self.base))
+            .json(&serde_json::json!({ "model": name, "stream": true }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<Line>(&text).ok().and_then(|l| l.error).unwrap_or(text);
+            anyhow::bail!("Ollama answered {status}: {msg}");
+        }
+        let mut layers: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut body = resp.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("cancelled");
+            }
+            buf.extend_from_slice(&chunk?);
+            while let Some(end) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=end).collect();
+                let Ok(l) = serde_json::from_slice::<Line>(&line) else { continue };
+                if let Some(e) = l.error {
+                    anyhow::bail!("Ollama: {e}");
+                }
+                if let (Some(d), Some(total)) = (l.digest, l.total) {
+                    layers.insert(d, (l.completed.unwrap_or(0), total));
+                    let done = layers.values().map(|(c, _)| c).sum();
+                    let total = layers.values().map(|(_, t)| t).sum();
+                    progress(done, Some(total));
+                }
+                if l.status == "success" {
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("Ollama stopped answering before the pull finished")
+    }
 }
 
 /// The Ollama endpoints apps may use; every other `/api/*` path is refused.

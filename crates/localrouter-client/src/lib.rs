@@ -163,6 +163,36 @@ pub struct TranscribeOptions {
     pub segments: Option<Vec<Segment>>,
     /// Seconds added to every time (`lr_offset`), for live windows.
     pub offset: f64,
+    /// `live` for live windows, `batch` for work nobody waits for (`lr_priority`).
+    pub priority: Option<String>,
+}
+
+/// A download Local Router runs for the app (PROTOCOL.md 8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Download {
+    pub id: String,
+    pub model: String,
+    pub source: String,
+    /// `queued`, `running`, `verifying`, `done`, `failed` or `cancelled`.
+    pub state: String,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub bytes_total: Option<u64>,
+    #[serde(default)]
+    pub started_by_you: bool,
+    #[serde(default)]
+    pub error: Option<ApiError>,
+}
+
+impl Download {
+    pub fn finished(&self) -> bool {
+        matches!(self.state.as_str(), "done" | "failed" | "cancelled")
+    }
+
+    /// 0.0 to 1.0, when the size is known.
+    pub fn fraction(&self) -> Option<f64> {
+        self.bytes_total.filter(|t| *t > 0).map(|t| (self.bytes_done as f64 / t as f64).min(1.0))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -315,6 +345,59 @@ impl Client {
 
     /// Speech to text; `audio` is the file's bytes and `filename` its name (for the format).
     pub async fn transcribe(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> Result<Transcript> {
+        let form = self.transcribe_form(audio, filename, opts);
+        let resp = self.send(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
+        let model = resp.headers().get("LR-Resolved-Model").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let mut t: Transcript = resp.json().await.map_err(|e| Error::Transport(e.to_string()))?;
+        t.model = model;
+        Ok(t)
+    }
+
+    /// Speech to text with each finished segment handed to `on_segment` as it
+    /// arrives (`stream=true`); returns the whole transcript at the end.
+    pub async fn transcribe_streaming(
+        &self,
+        audio: Vec<u8>,
+        filename: &str,
+        opts: &TranscribeOptions,
+        mut on_segment: impl FnMut(TranscriptSegment),
+    ) -> Result<Transcript> {
+        use futures::StreamExt;
+        let form = self.transcribe_form(audio, filename, opts).text("stream", "true");
+        let resp = self.send(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
+        let model = resp.headers().get("LR-Resolved-Model").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let mut body = resp.bytes_stream();
+        let mut buf = String::new();
+        while let Some(chunk) = body.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk.map_err(|e| Error::Transport(e.to_string()))?));
+            while let Some(end) = buf.find("\n\n") {
+                let block: String = buf.drain(..end + 2).collect();
+                let data: String = block.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim).collect();
+                let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+                match v["type"].as_str() {
+                    Some("transcript.text.segment") => {
+                        if let Ok(s) = serde_json::from_value(v["segment"].clone()) {
+                            on_segment(s);
+                        }
+                    }
+                    Some("transcript.text.done") => {
+                        let mut t: Transcript = serde_json::from_value(v).map_err(|e| Error::Other(e.to_string()))?;
+                        t.model = model;
+                        return Ok(t);
+                    }
+                    Some("error") => {
+                        let e: ApiError = serde_json::from_value(v["error"].clone())
+                            .unwrap_or_else(|_| ApiError::internal("transcription failed"));
+                        return Err(Error::Api(Box::new(e)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(Error::Transport("the transcription stream ended early".into()))
+    }
+
+    fn transcribe_form(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> reqwest::multipart::Form {
         let mut form = reqwest::multipart::Form::new()
             .part("file", reqwest::multipart::Part::bytes(audio).file_name(filename.to_string()))
             .text("model", opts.model.clone().unwrap_or_else(|| "localrouter/transcribe".into()))
@@ -333,11 +416,61 @@ impl Client {
         if opts.offset != 0.0 {
             form = form.text("lr_offset", opts.offset.to_string());
         }
-        let resp = self.send(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
-        let model = resp.headers().get("LR-Resolved-Model").and_then(|v| v.to_str().ok()).map(str::to_owned);
-        let mut t: Transcript = resp.json().await.map_err(|e| Error::Transport(e.to_string()))?;
-        t.model = model;
-        Ok(t)
+        if let Some(p) = &opts.priority {
+            form = form.text("lr_priority", p.clone());
+        }
+        form
+    }
+
+    /// Ask Local Router to download a model (PROTOCOL.md 8). `request` is the
+    /// body of `POST /lr/v1/downloads`, for example
+    /// `{"model": {"store": "ollama", "id": "qwen3.5:9b"}, "source": "ollama"}`.
+    pub async fn download(&self, request: &Value) -> Result<Download> {
+        self.json(self.http.post(self.url("/lr/v1/downloads")).json(request)).await
+    }
+
+    pub async fn download_status(&self, id: &str) -> Result<Download> {
+        self.json(self.http.get(self.url(&format!("/lr/v1/downloads/{id}")))).await
+    }
+
+    /// Stop waiting for a download; it stops when no other app wants it.
+    pub async fn cancel_download(&self, id: &str) -> Result<Download> {
+        self.json(self.http.delete(self.url(&format!("/lr/v1/downloads/{id}")))).await
+    }
+
+    /// Follow a download to the end, calling `progress` about twice a second.
+    /// A failed download comes back as its error.
+    pub async fn wait_download(&self, mut d: Download, mut progress: impl FnMut(&Download)) -> Result<Download> {
+        loop {
+            progress(&d);
+            if d.finished() {
+                return match (d.state.as_str(), d.error.clone()) {
+                    ("failed", Some(e)) => Err(Error::Api(Box::new(e))),
+                    ("failed", None) => Err(Error::Other(format!("downloading {} failed", d.model))),
+                    ("cancelled", _) => Err(Error::Other(format!("downloading {} was cancelled", d.model))),
+                    _ => Ok(d),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            d = self.download_status(&d.id).await?;
+        }
+    }
+
+    /// Keep a model loaded, for example before the user presses Record
+    /// (PROTOCOL.md 7.2). `keep_alive` like `"15m"`; at most 4 hours.
+    pub async fn hold(&self, model: &str, context: Option<u32>, keep_alive: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "model": model });
+        if let Some(c) = context {
+            body["context"] = json!(c);
+        }
+        if let Some(k) = keep_alive {
+            body["keep_alive"] = json!(k);
+        }
+        self.json(self.http.post(self.url("/lr/v1/models/load")).json(&body)).await
+    }
+
+    pub async fn release(&self, model: &str) -> Result<()> {
+        self.send(self.http.post(self.url("/lr/v1/models/unload")).json(&json!({ "model": model }))).await.map(|_| ())
     }
 
     /// Who speaks when (PROTOCOL.md 11.5).

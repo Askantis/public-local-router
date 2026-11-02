@@ -26,13 +26,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::UnixListener;
 
+use crate::downloads::{self, DownloadRequest, Downloads, Plan};
 use crate::events::{Audience, Events, visible_to};
+use crate::holds::{self, Holds};
 use crate::ollama::{self, Ollama};
 use crate::speech::{self, Speech, TranscribeRequest};
 use crate::state::{self, Candidate, KeyEntry, PendingRequests, PendingStatus, Resolution, Store};
 
-pub const CAPABILITIES: &[&str] =
-    &["connect", "roles", "resident", "events", "audio.transcriptions", "audio.diarizations", "chat", "embeddings", "ollama.passthrough"];
+pub const CAPABILITIES: &[&str] = &[
+    "connect", "roles", "resident", "events", "downloads", "holds", "audio.transcriptions", "audio.diarizations", "chat",
+    "embeddings", "ollama.passthrough",
+];
 
 /// Longest upload (PROTOCOL.md 11.4).
 const MAX_UPLOAD: usize = 2 << 30;
@@ -48,6 +52,8 @@ pub struct AppState {
     pub ollama_state: RwLock<OllamaInfo>,
     /// Models apps run themselves: approval key → (models, lease end).
     pub resident: Mutex<HashMap<String, Resident>>,
+    pub downloads: Downloads,
+    pub holds: Holds,
     pub shutdown: tokio::sync::Notify,
 }
 
@@ -184,7 +190,11 @@ pub fn router(st: Shared, transport: Transport) -> Router {
         .route("/lr/v1/me/roles", put(put_roles))
         .route("/lr/v1/me/resident", put(put_resident))
         .route("/lr/v1/models", get(models))
+        .route("/lr/v1/models/load", post(models_load))
+        .route("/lr/v1/models/unload", post(models_unload))
         .route("/lr/v1/events", get(events))
+        .route("/lr/v1/downloads", get(list_downloads).post(start_download))
+        .route("/lr/v1/downloads/{id}", get(get_download).delete(cancel_download))
         .route("/lr/v1/audio/diarizations", post(diarizations).layer(DefaultBodyLimit::max(MAX_UPLOAD)))
         .route("/v1/audio/transcriptions", post(transcriptions).layer(DefaultBodyLimit::max(MAX_UPLOAD)))
         .route("/v1/models", get(openai_models))
@@ -347,7 +357,11 @@ async fn models(State(st): State<Shared>, caller: Caller, Query(f): Query<ModelF
         if let Some(p) = &m.parameters { v["parameters"] = json!(p); }
         if let Some(c) = m.context_length { v["context_length"] = json!(c); }
         if let Some(l) = loaded {
-            v["loaded"] = json!({ "memory_bytes": l.size_vram.max(l.size), "context": l.context_length, "expires_at": l.expires_at });
+            let (holders, mine) = st.holds.count(&m.name, &key);
+            v["loaded"] = json!({
+                "memory_bytes": l.size_vram.max(l.size), "context": l.context_length, "expires_at": l.expires_at,
+                "held_by_you": mine, "holders": holders,
+            });
         }
         out.push(v);
     }
@@ -360,6 +374,10 @@ async fn models(State(st): State<Shared>, caller: Caller, Query(f): Query<ModelF
             "state": if speech_loaded.contains(id) { "loaded" } else { "available" },
             "bound_for_you": bound(id),
         }));
+        if speech_loaded.contains(id) {
+            let (holders, mine) = st.holds.count(id, &key);
+            out.last_mut().unwrap()["loaded"] = json!({ "memory_bytes": size, "held_by_you": mine, "holders": holders });
+        }
     }
     let now = Instant::now();
     for (owner, (list, until)) in st.resident.lock().unwrap().iter() {
@@ -521,11 +539,102 @@ async fn disconnect(State(st): State<Shared>, caller: Caller) -> R<StatusCode> {
     if key.starts_with("key:") {
         return Err(ApiError::forbidden("Keys are removed in Local Router.").into());
     }
-    let mut store = st.store.write().unwrap();
-    store.apps.remove(&key);
-    let _ = store.save();
+    {
+        let mut store = st.store.write().unwrap();
+        store.apps.remove(&key);
+        let _ = store.save();
+    }
     st.resident.lock().unwrap().remove(&key);
+    for model in st.holds.remove_app(&key) {
+        release(&st, &model).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Holding models (PROTOCOL.md 7.2) ──────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoadBody {
+    model: String,
+    #[serde(default)]
+    context: Option<u32>,
+    #[serde(default)]
+    keep_alive: Option<Value>,
+}
+
+async fn models_load(State(st): State<Shared>, caller: Caller, Json(b): Json<LoadBody>) -> R<Json<Value>> {
+    let key = connected(&st, &caller)?;
+    let keep = holds::parse_keep(b.keep_alive.as_ref()).map_err(|m| ApiError::invalid(m).with_param("keep_alive"))?;
+    let (model, min_ctx) = resolve_model(&st, &key, &b.model).await?;
+    touch(&st, &key);
+
+    if Speech::knows(&model) {
+        let speech = st.speech_handle();
+        let id = model.clone();
+        tokio::task::spawn_blocking(move || speech.preload(&id))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(|_| ApiError::model_not_downloaded(&model))?;
+        st.holds.add(&model, &key, None, keep);
+        st.events.send("model.state", json!({ "id": model, "state": "loaded" }), Audience::Everyone);
+        return Ok(Json(json!({ "model": model, "state": "loaded" })));
+    }
+
+    let inv = Inventory::get(&st).await;
+    let Some(m) = inv.ollama.iter().find(|m| m.name == model) else { return Err(ApiError::model_not_downloaded(&model).into()) };
+    let embedding = m.capabilities.iter().any(|c| c == "embedding");
+    let loaded_ctx = inv.loaded.iter().find(|l| l.name == model).and_then(|l| l.context_length);
+    let wanted = b.context.or(min_ctx);
+    // A bigger context means loading again, which other holders would feel.
+    if let Some(want) = wanted
+        && st.holds.others(&model, &key).is_some()
+        && loaded_ctx.is_some_and(|l| l < want)
+    {
+        return Err(ApiError::new(409, "invalid_request_error", "context_in_use", format!("{model} is in use with a smaller context."))
+            .with_details(json!({ "loaded_context": loaded_ctx, "requested_context": want }))
+            .into());
+    }
+    let ctx = st.holds.add(&model, &key, wanted, keep).or(loaded_ctx);
+    // Ollama keeps it a little longer than the hold; the hold decides.
+    if let Err(e) = st.ollama.hold(&model, Some(keep.as_secs() + 60), ctx, embedding).await {
+        st.holds.remove(&model, &key);
+        return Err(ApiError::upstream_unavailable(format!("Ollama couldn't load {model}: {e}")).into());
+    }
+    st.events.send("model.state", json!({ "id": model, "state": "loaded" }), Audience::Everyone);
+    let expires = time::OffsetDateTime::now_utc() + keep;
+    Ok(Json(json!({
+        "model": model, "state": "loaded", "context": ctx,
+        "expires_at": expires.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct UnloadBody {
+    model: String,
+}
+
+async fn models_unload(State(st): State<Shared>, caller: Caller, Json(b): Json<UnloadBody>) -> R<StatusCode> {
+    let key = connected(&st, &caller)?;
+    let (model, _) = resolve_model(&st, &key, &b.model).await?;
+    if st.holds.remove(&model, &key) {
+        release(&st, &model).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Nobody holds `model` any more. Speech models are freed; Ollama models
+/// go back to Ollama's own idle time (Local Router's window re-pins models
+/// the user pinned).
+pub async fn release(st: &AppState, model: &str) {
+    if Speech::knows(model) {
+        st.speech.unload(model);
+        st.events.send("model.state", json!({ "id": model, "state": "available" }), Audience::Everyone);
+        return;
+    }
+    let inv = Inventory::get(st).await;
+    let Some(loaded) = inv.loaded.iter().find(|l| l.name == model) else { return };
+    let embedding = inv.ollama.iter().any(|m| m.name == model && m.capabilities.iter().any(|c| c == "embedding"));
+    let _ = st.ollama.hold(model, None, loaded.context_length, embedding).await;
 }
 
 #[derive(Deserialize)]
@@ -630,6 +739,156 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(f(tx));
     futures::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(rx), Ok)
+}
+
+// ─── Downloads (PROTOCOL.md 8) ─────────────────────────────────────────────
+
+/// Whose download it is: a connected app, or Local Router's own window.
+fn download_key(st: &AppState, caller: &Caller) -> Result<String, ApiError> {
+    match connected(st, caller) {
+        Ok(key) => Ok(key),
+        Err(_) if is_admin(caller) => Ok(downloads::ADMIN.into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Check a request and decide what to download.
+fn plan_for(caller: &Caller, req: DownloadRequest) -> Result<Plan, ApiError> {
+    let DownloadRequest { model, source, token, mirror } = req;
+    let revision = model.revision.clone().unwrap_or_else(|| "main".into());
+    if !localrouter_hf::is_valid_revision(&revision) {
+        return Err(ApiError::invalid("revision isn't a branch name or commit hash").with_param("model.revision"));
+    }
+    match source.as_str() {
+        "ollama" => {
+            if model.store != "ollama" || model.file.is_some() || mirror.is_some() {
+                return Err(ApiError::invalid("an ollama download takes an Ollama model name").with_param("model"));
+            }
+            if !downloads::valid_ollama_name(&model.id) {
+                return Err(ApiError::invalid("not an Ollama model name").with_param("model.id"));
+            }
+            Ok(Plan::Ollama { name: model.id })
+        }
+        "hf" => {
+            if model.store != "hf" || mirror.is_some() || !localrouter_hf::is_valid_repo(&model.id) {
+                return Err(ApiError::invalid("an hf download takes a repository id like org/name").with_param("model.id"));
+            }
+            match model.file {
+                Some(file) if !localrouter_hf::is_valid_file(&file) => {
+                    Err(ApiError::invalid("not a file path inside the repository").with_param("model.file"))
+                }
+                Some(file) => Ok(Plan::HfFile { repo: model.id, file, revision, token }),
+                None => Ok(Plan::HfRepo { repo: model.id, revision, token }),
+            }
+        }
+        "mirror" => {
+            let mirror = mirror.ok_or_else(|| ApiError::invalid("a mirror download needs `mirror`").with_param("mirror"))?;
+            if model.store != "hf" || !localrouter_hf::is_valid_repo(&model.id) {
+                return Err(ApiError::invalid("a mirror download takes a repository id like org/name").with_param("model.id"));
+            }
+            // Rule 1: signed apps only, into their own organisation.
+            let Caller::Socket(id) = caller else {
+                return Err(ApiError::forbidden("Mirror downloads are for signed apps."));
+            };
+            let orgs: &[&str] = if cfg!(feature = "test-admin") {
+                &["askantis"]
+            } else if matches!(id.trust, Trust::Askantis | Trust::Signed) {
+                downloads::mirror_orgs(id.team.as_deref())
+            } else {
+                &[]
+            };
+            let org = model.id.split('/').next().unwrap_or_default();
+            if !orgs.contains(&org) {
+                return Err(ApiError::forbidden(format!("This app can't place files in {org}/ repositories.")));
+            }
+            if mirror.files.is_empty() || mirror.files.len() > 1000 {
+                return Err(ApiError::invalid("a mirror lists 1 to 1000 files").with_param("mirror.files"));
+            }
+            Ok(Plan::Mirror { repo: model.id, commit: mirror.revision, files: mirror.files })
+        }
+        _ => Err(ApiError::invalid("source is ollama, hf or mirror").with_param("source")),
+    }
+}
+
+/// Whether there's nothing to do (PROTOCOL.md 8.2: no second download).
+async fn already_present(st: &AppState, plan: &Plan) -> bool {
+    match plan {
+        Plan::Ollama { name } => {
+            let want = if name.contains(':') { name.clone() } else { format!("{name}:latest") };
+            st.ollama.models().await.is_ok_and(|ms| ms.iter().any(|m| m.name == want))
+        }
+        Plan::HfFile { repo, file, revision, .. } => {
+            let Some(cache) = st.speech.cache() else { return false };
+            let (repo, file, revision) = (repo.clone(), file.clone(), revision.clone());
+            tokio::task::spawn_blocking(move || cache.snapshot_path(&repo, &file, &revision).ok().flatten().is_some())
+                .await
+                .unwrap_or(false)
+        }
+        // Present files are skipped without going online.
+        Plan::HfRepo { .. } | Plan::Mirror { .. } => false,
+    }
+}
+
+fn download_record(st: &AppState, job: &downloads::Job, key: &str) -> Value {
+    let mut v = job.record(Some(key));
+    if key == downloads::ADMIN {
+        // Local Router's window shows who asked (PROTOCOL.md 8.2).
+        let store = st.store.read().unwrap();
+        let names: Vec<String> = job
+            .starters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|k| match store.apps.get(k) {
+                Some(a) => a.name.clone(),
+                None if k == downloads::ADMIN => "Local Router".into(),
+                None => k.clone(),
+            })
+            .collect();
+        v["started_by"] = json!(names);
+    }
+    v
+}
+
+async fn start_download(State(st): State<Shared>, caller: Caller, Json(req): Json<DownloadRequest>) -> R<Response> {
+    let key = download_key(&st, &caller)?;
+    let plan = plan_for(&caller, req)?;
+    if let Plan::Mirror { files, .. } = &plan {
+        let cache = st.speech.cache().ok_or_else(|| ApiError::new(503, "server_error", "internal", "The Hugging Face cache isn't available."))?;
+        #[cfg(feature = "test-admin")]
+        let cache = cache.with_mirror_guard(localrouter_hf::MirrorGuard::AllowLoopbackForTests);
+        cache.check_mirror_files(files).map_err(downloads::hf_error)?;
+    }
+    let present = already_present(&st, &plan).await;
+    let (job, new) = st.downloads.start(&key, &plan);
+    if new && present {
+        job.progress.lock().unwrap().state = downloads::State::Running;
+        job.finish_now(&st.events);
+        return Ok((StatusCode::OK, Json(download_record(&st, &job, &key))).into_response());
+    }
+    if new {
+        tokio::spawn(downloads::run(job.clone(), plan, st.clone()));
+    }
+    Ok((StatusCode::ACCEPTED, Json(download_record(&st, &job, &key))).into_response())
+}
+
+async fn list_downloads(State(st): State<Shared>, caller: Caller) -> R<Json<Value>> {
+    let key = download_key(&st, &caller)?;
+    let list: Vec<Value> = st.downloads.list(&key).iter().map(|j| download_record(&st, j, &key)).collect();
+    Ok(Json(json!({ "downloads": list })))
+}
+
+async fn get_download(State(st): State<Shared>, caller: Caller, Path(id): Path<String>) -> R<Json<Value>> {
+    let key = download_key(&st, &caller)?;
+    let job = st.downloads.get(&key, &id).ok_or_else(|| ApiError::not_found("unknown download"))?;
+    Ok(Json(download_record(&st, &job, &key)))
+}
+
+async fn cancel_download(State(st): State<Shared>, caller: Caller, Path(id): Path<String>) -> R<Json<Value>> {
+    let key = download_key(&st, &caller)?;
+    let job = st.downloads.get(&key, &id).ok_or_else(|| ApiError::not_found("unknown download"))?;
+    st.downloads.cancel(&key, &job);
+    Ok(Json(job.record(Some(&key))))
 }
 
 // ─── Language models: Ollama and OpenAI pass-through ───────────────────────
@@ -836,12 +1095,17 @@ fn speech_response(v: Value, text: Option<String>, format: &str, model: &str) ->
 async fn transcriptions(State(st): State<Shared>, caller: Caller, mp: Multipart) -> R<Response> {
     let key = connected(&st, &caller)?;
     let up = read_upload(mp).await?;
-    if up.flag("stream") {
-        return Err(ApiError::invalid("stream=true isn't supported by this version of Local Router yet").with_param("stream").into());
-    }
     let format = up.get("response_format").unwrap_or("json").to_string();
     if !["json", "text", "srt", "vtt", "verbose_json", "lr_speakers_json"].contains(&format.as_str()) {
         return Err(ApiError::invalid(format!("unknown response_format {format}")).with_param("response_format").into());
+    }
+    let stream = up.flag("stream");
+    if stream && !["json", "verbose_json", "lr_speakers_json"].contains(&format.as_str()) {
+        return Err(ApiError::invalid("stream=true works with json, verbose_json and lr_speakers_json").with_param("stream").into());
+    }
+    let priority = up.get("lr_priority").unwrap_or("interactive").to_string();
+    if !["live", "interactive", "batch"].contains(&priority.as_str()) {
+        return Err(ApiError::invalid("lr_priority is live, interactive or batch").with_param("lr_priority").into());
     }
     let model = speech_model(&st, &key, up.get("model").unwrap_or(""), "transcribe").await?;
     let granularities: Vec<&str> = up.fields.get("timestamp_granularities[]").map(|v| v.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
@@ -866,7 +1130,10 @@ async fn transcriptions(State(st): State<Shared>, caller: Caller, mp: Multipart)
     let audio_s = audio.duration_s();
     st.events.send("activity", json!({ "app_id": app_id_of(&st, &key), "model": model, "kind": "transcription", "phase": "started", "audio_seconds": audio_s }), Audience::Admin);
     touch(&st, &key);
-    let _job = st.speech.job.lock().await;
+    if stream {
+        return Ok(transcription_stream(st, key, model, format, priority, audio, req));
+    }
+    let _job = speech_turn(&st, &priority, &model).await;
     let st2 = st.clone();
     let result = tokio::task::spawn_blocking(move || st2.speech.transcribe(&audio, &req).map(|t| (t, req)))
         .await
@@ -876,6 +1143,60 @@ async fn transcriptions(State(st): State<Shared>, caller: Caller, mp: Multipart)
     let (t, req) = result;
     let (v, text) = speech::render(&t, &format, &req);
     Ok(speech_response(v, text, &format, &model))
+}
+
+/// Wait for the speech engine. Files take turns, whole; a live window that
+/// uses the model already in memory goes between the windows of a running
+/// file instead of waiting for all of it (PROTOCOL.md 11.4 `lr_priority`).
+async fn speech_turn<'a>(st: &'a AppState, priority: &str, model: &str) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    if priority == "live" && st.speech.asr_is(model) {
+        return None;
+    }
+    Some(st.speech.job.lock().await)
+}
+
+/// `stream=true`: each finished segment as soon as it's ready, then the whole answer.
+fn transcription_stream(st: Shared, key: String, model: String, format: String, priority: String, audio: localrouter_audio::Audio, req: TranscribeRequest) -> Response {
+    let resolved = model.clone();
+    let body = async_stream(move |tx| async move {
+        let audio_s = audio.duration_s();
+        let _job = speech_turn(&st, &priority, &model).await;
+        let st2 = st.clone();
+        let fmt = format.clone();
+        let tx2 = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut n = 0usize;
+            let mut sink = |turn: &localrouter_speech::TranscriptTurn| {
+                let seg = speech::segment_json(n, turn, &fmt, &req);
+                n += 1;
+                let delta = if n == 1 { turn.text.clone() } else { format!(" {}", turn.text) };
+                let _ = tx2.blocking_send(SseEvent::default().event("transcript.text.delta").data(json!({ "type": "transcript.text.delta", "delta": delta }).to_string()));
+                let _ = tx2.blocking_send(SseEvent::default().event("transcript.text.segment").data(json!({ "type": "transcript.text.segment", "segment": seg }).to_string()));
+            };
+            st2.speech.transcribe_streaming(&audio, &req, &mut sink).map(|t| (t, req))
+        })
+        .await;
+        st.events.send("activity", json!({ "app_id": app_id_of(&st, &key), "model": model, "kind": "transcription", "phase": "finished", "audio_seconds": audio_s }), Audience::Admin);
+        let event = match result {
+            Ok(Ok((t, req))) => {
+                let (mut v, _) = speech::render(&t, &format, &req);
+                v["type"] = json!("transcript.text.done");
+                SseEvent::default().event("transcript.text.done").data(v.to_string())
+            }
+            Ok(Err(e)) => error_event(ApiError::internal(format!("{e:#}"))),
+            Err(e) => error_event(ApiError::internal(e.to_string())),
+        };
+        let _ = tx.send(event).await;
+    });
+    let mut resp = Sse::new(body).into_response();
+    if let Ok(h) = HeaderValue::from_str(&resolved) {
+        resp.headers_mut().insert("LR-Resolved-Model", h);
+    }
+    resp
+}
+
+fn error_event(e: ApiError) -> SseEvent {
+    SseEvent::default().event("error").data(json!({ "type": "error", "error": e }).to_string())
 }
 
 async fn diarizations(State(st): State<Shared>, caller: Caller, mp: Multipart) -> R<Response> {

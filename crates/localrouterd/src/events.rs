@@ -15,6 +15,8 @@ pub enum Audience {
     Everyone,
     /// One app, by approval key.
     App(String),
+    /// Several apps, for example the ones that asked for a download.
+    Apps(Vec<String>),
     /// Local Router's own window.
     Admin,
 }
@@ -76,6 +78,7 @@ pub fn visible_to(ev: &Event, app_key: Option<&str>, admin: bool) -> bool {
         Audience::Everyone => true,
         Audience::Admin => admin,
         Audience::App(k) => admin || app_key == Some(k.as_str()),
+        Audience::Apps(keys) => admin || app_key.is_some_and(|k| keys.iter().any(|x| x == k)),
     }
 }
 

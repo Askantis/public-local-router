@@ -98,6 +98,7 @@ impl Drop for Daemon {
 }
 
 pub async fn fake_ollama(seen: Arc<Mutex<Vec<Value>>>) -> u16 {
+    let loaded: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
     let echo = |seen: Arc<Mutex<Vec<Value>>>| {
         move |Json(v): Json<Value>| {
             let seen = seen.clone();
@@ -120,7 +121,41 @@ pub async fn fake_ollama(seen: Arc<Mutex<Vec<Value>>>) -> u16 {
             let ctx = match v["model"].as_str() { Some("qwen3.5:9b") => 262_144, Some("tiny:1b") => 4096, _ => 8192 };
             Json(json!({ "model_info": { "general.architecture": "x", "x.context_length": ctx } }))
         }))
-        .route("/api/ps", get(|| async { Json(json!({ "models": [] })) }))
+        .route("/api/ps", get({
+            let loaded = loaded.clone();
+            move || {
+                let list: Vec<Value> = loaded.lock().unwrap().iter().map(|(m, c)| json!({ "name": m, "size": 1, "context_length": c })).collect();
+                async move { Json(json!({ "models": list })) }
+            }
+        }))
+        .route("/api/generate", post({
+            let (seen, loaded) = (seen.clone(), loaded.clone());
+            move |Json(v): Json<Value>| {
+                seen.lock().unwrap().push(v.clone());
+                let mut l = loaded.lock().unwrap();
+                let model = v["model"].as_str().unwrap_or_default().to_string();
+                l.retain(|(m, _)| *m != model);
+                if v["keep_alive"] != json!(0) {
+                    l.push((model, v["options"]["num_ctx"].as_u64().unwrap_or(4096)));
+                }
+                async move { Json(json!({ "model": v["model"], "response": "", "done": true })) }
+            }
+        }))
+        .route("/api/pull", post(|Json(v): Json<Value>| async move {
+            let lines: Vec<Value> = if v["model"] == "new:3b" {
+                vec![
+                    json!({ "status": "pulling manifest" }),
+                    json!({ "status": "pulling aa", "digest": "sha256:aa", "total": 1000, "completed": 0 }),
+                    json!({ "status": "pulling aa", "digest": "sha256:aa", "total": 1000, "completed": 1000 }),
+                    json!({ "status": "pulling bb", "digest": "sha256:bb", "total": 24, "completed": 24 }),
+                    json!({ "status": "verifying sha256 digest" }),
+                    json!({ "status": "success" }),
+                ]
+            } else {
+                vec![json!({ "status": "pulling manifest" }), json!({ "error": "pull model manifest: file does not exist" })]
+            };
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>()
+        }))
         .route("/api/chat", post(echo(seen.clone())))
         .route("/v1/chat/completions", post(echo(seen.clone())));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -134,18 +169,28 @@ pub fn free_port() -> u16 {
 }
 
 pub async fn start(prepare: impl FnOnce(&Path)) -> Daemon {
+    start_with(prepare, false).await
+}
+
+/// With the computer's real Hugging Face cache, for tests that need speech models.
+pub async fn start_real_cache() -> Daemon {
+    start_with(|_| {}, true).await
+}
+
+async fn start_with(prepare: impl FnOnce(&Path), real_cache: bool) -> Daemon {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let ollama = fake_ollama(seen.clone()).await;
     let dir = tempfile::Builder::new().prefix("lrd").tempdir_in("/tmp").unwrap(); // short path: sockets max 104 bytes
     prepare(dir.path());
     let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_localrouterd"))
-        .env("LR_SUPPORT_DIR", dir.path())
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_localrouterd"));
+    cmd.env("LR_SUPPORT_DIR", dir.path())
         .env("LR_PORT", port.to_string())
-        .env("LR_OLLAMA_URL", format!("http://127.0.0.1:{ollama}"))
-        .env("HF_HUB_CACHE", dir.path().join("hub")) // an empty cache: no speech models
-        .spawn()
-        .unwrap();
+        .env("LR_OLLAMA_URL", format!("http://127.0.0.1:{ollama}"));
+    if !real_cache {
+        cmd.env("HF_HUB_CACHE", dir.path().join("hub")); // an empty cache: no speech models
+    }
+    let child = cmd.spawn().unwrap();
     let endpoint = dir.path().join("endpoint.json");
     let t0 = Instant::now();
     while !endpoint.exists() {

@@ -7,11 +7,18 @@
 //! - [`Cache::download`] fetches a file from huggingface.co into the standard
 //!   layout (`blobs/`, `snapshots/<commit>/`, `refs/`), resumably and with the
 //!   same lock files as `huggingface_hub`, so Python tools see it too.
+//! - [`Cache::install_mirror`] places files from another server (an app
+//!   maker's own mirror) into the same layout, under the rules of PROTOCOL.md
+//!   section 8.1.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+mod mirror;
+pub use mirror::{MirrorFile, MirrorGuard};
 
 use sha2::{Digest, Sha256};
 
@@ -174,6 +181,12 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("network error: {0}")]
     Network(String),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    NotAllowed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -184,6 +197,7 @@ pub struct Cache {
     hub: PathBuf,
     endpoint: String,
     token: Option<String>,
+    guard: MirrorGuard,
 }
 
 /// Progress callback: `(bytes_done, bytes_total)`.
@@ -191,7 +205,7 @@ pub type Progress<'a> = &'a mut dyn FnMut(u64, Option<u64>);
 
 impl Cache {
     pub fn new(hub: impl Into<PathBuf>) -> Self {
-        Cache { hub: hub.into(), endpoint: "https://huggingface.co".into(), token: None }
+        Cache { hub: hub.into(), endpoint: "https://huggingface.co".into(), token: None, guard: MirrorGuard::PublicHttpsOnly }
     }
 
     /// The cache at the standard place, or an error if it can't be used.
@@ -212,6 +226,13 @@ impl Cache {
     /// A token for gated or private repositories. Used for requests, never stored.
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
+        self
+    }
+
+    /// Which mirror addresses [`Cache::install_mirror`] accepts. Only tests
+    /// should ever loosen it.
+    pub fn with_mirror_guard(mut self, guard: MirrorGuard) -> Self {
+        self.guard = guard;
         self
     }
 
@@ -263,6 +284,19 @@ impl Cache {
         revision: &str,
         progress: Progress<'_>,
     ) -> Result<PathBuf> {
+        self.download_cancellable(repo, file, revision, progress, &AtomicBool::new(false))
+    }
+
+    /// [`Cache::download`] that stops with [`Error::Cancelled`] once `cancel`
+    /// is set. The partial file stays, so a later download resumes it.
+    pub fn download_cancellable(
+        &self,
+        repo: &str,
+        file: &str,
+        revision: &str,
+        progress: Progress<'_>,
+        cancel: &AtomicBool,
+    ) -> Result<PathBuf> {
         if let Some(path) = self.snapshot_path(repo, file, revision)? {
             return Ok(path);
         }
@@ -290,7 +324,8 @@ impl Cache {
             lock.lock()?; // the same lock huggingface_hub's filelock takes
             if !blob.is_file() {
                 let incomplete = blob.with_file_name(format!("{}.incomplete", meta.etag));
-                self.fetch(&meta.location.unwrap_or(url.clone()), &incomplete, meta.size, progress)?;
+                let agent = self.agent(5);
+                fetch(&agent, &meta.location.unwrap_or(url.clone()), self.token_for(&url), &incomplete, meta.size, progress, cancel)?;
                 if meta.etag.len() == 64 {
                     let got = sha256_file(&incomplete)?;
                     if got != meta.etag {
@@ -354,49 +389,128 @@ impl Cache {
         Ok(HeadMeta { commit: h("x-repo-commit"), etag, size, location })
     }
 
-    fn fetch(&self, url: &str, dest: &Path, total: Option<u64>, progress: Progress<'_>) -> Result<()> {
-        let mut done = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-        let mut req = self.agent(5).get(url).header("User-Agent", user_agent());
-        // The token goes to huggingface.co only, never to the CDN it redirects to.
-        if let (Some(t), true) = (&self.token, url.starts_with(&self.endpoint)) {
+    /// The token goes to huggingface.co only, never to the CDN it redirects to.
+    fn token_for(&self, url: &str) -> Option<&str> {
+        self.token.as_deref().filter(|_| url.starts_with(&self.endpoint))
+    }
+
+    /// The commit a revision points to on huggingface.co, and the repository's
+    /// files at that commit.
+    pub fn list_files(&self, repo: &str, revision: &str) -> Result<(String, Vec<String>)> {
+        let url = format!("{}/api/models/{}/revision/{}", self.endpoint, checked_repo(repo)?, checked_segment(revision)?);
+        let mut req = self.agent(5).get(&url).header("User-Agent", user_agent());
+        if let Some(t) = &self.token {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
-        if done > 0 {
-            req = req.header("Range", format!("bytes={done}-"));
-        }
-        let resp = req.call().map_err(|e| Error::Network(e.to_string()))?;
+        let mut resp = req.call().map_err(|e| Error::Network(e.to_string()))?;
         let status = resp.status().as_u16();
-        let mut out = match status {
-            206 => OpenOptions::new().append(true).open(dest)?,
-            200 => {
-                done = 0;
-                File::create(dest)?
-            }
-            _ => return Err(Error::Http { status, url: url.to_string() }),
-        };
-        let mut body = resp.into_body().into_reader();
-        let mut buf = vec![0u8; 1 << 20];
-        progress(done, total);
-        loop {
-            let n = body.read(&mut buf).map_err(|e| Error::Network(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-            done += n as u64;
-            if let Some(t) = total
-                && done > t {
-                    return Err(Error::Network(format!("{url} sent more than {t} bytes")));
-                }
-            progress(done, total);
+        if status == 404 || status == 401 {
+            return Err(Error::NotFound(repo.to_string()));
         }
-        out.sync_all()?;
-        if let Some(t) = total
-            && done != t {
-                return Err(Error::Network(format!("{url} ended after {done} of {t} bytes")));
-            }
-        Ok(())
+        if status != 200 {
+            return Err(Error::Http { status, url });
+        }
+        #[derive(serde::Deserialize)]
+        struct Info {
+            sha: String,
+            #[serde(default)]
+            siblings: Vec<Sibling>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Sibling {
+            rfilename: String,
+        }
+        let text = resp.body_mut().with_config().limit(16 << 20).read_to_string().map_err(|e| Error::Network(e.to_string()))?;
+        let info: Info = serde_json::from_str(&text).map_err(|e| Error::Network(e.to_string()))?;
+        if !is_commit_hash(&info.sha) {
+            return Err(Error::MissingHeaders(url));
+        }
+        let files = info.siblings.into_iter().map(|s| s.rfilename).filter(|f| checked_file(f).is_ok()).collect();
+        Ok((info.sha, files))
     }
+}
+
+/// GET `url` into `dest`, resuming what's already there with a Range request.
+/// Stops at `total` bytes (more is an error) and when `cancel` is set.
+fn fetch(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+    dest: &Path,
+    total: Option<u64>,
+    progress: Progress<'_>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut done = fs::symlink_metadata(dest).map(|m| m.len()).unwrap_or(0);
+    let mut req = agent.get(url).header("User-Agent", user_agent());
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    if done > 0 {
+        req = req.header("Range", format!("bytes={done}-"));
+    }
+    let resp = req.call().map_err(|e| Error::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let mut out = match status {
+        206 => open_no_follow(dest, true)?,
+        200 => {
+            done = 0;
+            open_no_follow(dest, false)?
+        }
+        416 if total == Some(done) => return Ok(()),
+        _ => return Err(Error::Http { status, url: redact(url) }),
+    };
+    let mut body = resp.into_body().into_reader();
+    let mut buf = vec![0u8; 1 << 20];
+    progress(done, total);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let n = body.read(&mut buf).map_err(|e| Error::Network(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        if let Some(t) = total
+            && done + n as u64 > t
+        {
+            return Err(Error::Network(format!("{} sent more than {t} bytes", redact(url))));
+        }
+        out.write_all(&buf[..n])?;
+        done += n as u64;
+        progress(done, total);
+    }
+    out.sync_all()?;
+    if let Some(t) = total
+        && done != t
+    {
+        return Err(Error::Network(format!("{} ended after {done} of {t} bytes", redact(url))));
+    }
+    Ok(())
+}
+
+/// Open for writing without following a symbolic link at `path`.
+fn open_no_follow(path: &Path, append: bool) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.write(true).create(true);
+    if append { o.append(true) } else { o.truncate(true) };
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW);
+    o.open(path)
+}
+
+/// A lock file: opened for writing, kept as it is, links not followed.
+fn open_no_follow_keep(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW);
+    o.open(path)
+}
+
+/// A URL without its query, which may hold a signature (PROTOCOL.md 8.1 rule 6).
+fn redact(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or(url).to_string()
 }
 
 struct HeadMeta {
@@ -408,6 +522,21 @@ struct HeadMeta {
 
 fn user_agent() -> String {
     format!("localrouter-hf/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `org/name`, with parts that can't leave the cache.
+pub fn is_valid_repo(repo: &str) -> bool {
+    checked_repo(repo).is_ok()
+}
+
+/// A relative path inside a repository.
+pub fn is_valid_file(file: &str) -> bool {
+    checked_file(file).is_ok()
+}
+
+/// A branch name or a commit hash.
+pub fn is_valid_revision(revision: &str) -> bool {
+    checked_segment(revision).is_ok()
 }
 
 fn is_commit_hash(s: &str) -> bool {
@@ -585,5 +714,16 @@ mod tests {
         let again = cache.download("ggml-org/whisper-vad", "ggml-silero-v6.2.0.bin", "main", &mut |_, _| {}).unwrap();
         assert_eq!(path, again);
         assert!(tmp.path().join("models--ggml-org--whisper-vad/refs/main").is_file());
+    }
+
+    /// Real listing from huggingface.co. Run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn lists_a_repository_like_the_hub_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (commit, files) = Cache::new(tmp.path()).list_files("ggml-org/whisper-vad", "main").unwrap();
+        assert!(is_commit_hash(&commit));
+        assert!(files.iter().any(|f| f == "ggml-silero-v6.2.0.bin"), "{files:?}");
+        assert!(matches!(Cache::new(tmp.path()).list_files("ggml-org/does-not-exist-lr", "main"), Err(Error::NotFound(_))));
     }
 }
