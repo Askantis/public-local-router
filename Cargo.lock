@@ -1402,6 +1402,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "core-foundation",
+ "futures",
  "localrouter-audio",
  "localrouter-core",
  "localrouter-hf",
@@ -1432,6 +1433,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

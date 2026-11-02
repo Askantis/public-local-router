@@ -28,7 +28,7 @@ impl Speech {
         *self.cache.write().unwrap() = cache;
     }
 
-    fn cache(&self) -> Option<Cache> {
+    pub fn cache(&self) -> Option<Cache> {
         self.cache.read().unwrap().clone()
     }
 
@@ -75,6 +75,32 @@ impl Speech {
         f(slot.as_mut().unwrap())
     }
 
+    /// Whether Local Router runs this model itself (rather than Ollama).
+    pub fn knows(model_id: &str) -> bool {
+        catalog::whisper_by_model_id(model_id).is_some() || model_id == catalog::speaker_model_id()
+    }
+
+    /// Load a speech model now, so the first request doesn't wait for it.
+    pub fn preload(&self, model_id: &str) -> Result<()> {
+        if model_id == catalog::speaker_model_id() {
+            self.with_diarizer(|_| Ok(()))
+        } else {
+            self.asr_for(model_id).map(|_| ())
+        }
+    }
+
+    /// Free a speech model's memory.
+    pub fn unload(&self, model_id: &str) {
+        if model_id == catalog::speaker_model_id() {
+            *self.diarizer.lock().unwrap() = None;
+        } else {
+            let mut slot = self.asr.lock().unwrap();
+            if slot.as_ref().is_some_and(|(id, _)| id == model_id) {
+                *slot = None;
+            }
+        }
+    }
+
     pub fn loaded(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some((id, _)) = self.asr.lock().unwrap().as_ref() {
@@ -93,6 +119,22 @@ impl Speech {
     }
 
     pub fn transcribe(&self, audio: &Audio, req: &TranscribeRequest) -> Result<localrouter_speech::Transcript> {
+        self.transcribe_streaming(audio, req, &mut |_| {})
+    }
+
+    /// Whether `model_id` is the speech-to-text model in memory now.
+    pub fn asr_is(&self, model_id: &str) -> bool {
+        self.asr.lock().unwrap().as_ref().is_some_and(|(id, _)| id == model_id)
+    }
+
+    /// [`Speech::transcribe`], handing each finished turn to `sink` (with
+    /// short speaker labels) as soon as it's final.
+    pub fn transcribe_streaming(
+        &self,
+        audio: &Audio,
+        req: &TranscribeRequest,
+        sink: &mut dyn FnMut(&localrouter_speech::TranscriptTurn),
+    ) -> Result<localrouter_speech::Transcript> {
         let asr = self.asr_for(&req.model_id)?;
         let opts = AsrOptions { language: req.language.clone(), prompt: req.prompt.clone(), threads: 0 };
         let turns = match (&req.segments, req.diarize) {
@@ -100,7 +142,10 @@ impl Speech {
             (None, true) => Some(localrouter_speech::merge_same_speaker(&self.diarize(audio)?)),
             (None, false) => None,
         };
-        let mut t = localrouter_speech::transcribe_turns(audio, &asr, turns, &opts, Strategy::Windows, &mut |_, _| {})?;
+        let mut relabelled = |turn: &localrouter_speech::TranscriptTurn| {
+            sink(&localrouter_speech::TranscriptTurn { speaker: short_label(&turn.speaker), ..turn.clone() })
+        };
+        let mut t = localrouter_speech::transcribe_turns_streaming(audio, &asr, turns, &opts, Strategy::Windows, &mut |_, _| {}, &mut relabelled)?;
         for turn in &mut t.turns {
             turn.speaker = short_label(&turn.speaker);
         }
@@ -129,30 +174,30 @@ pub struct TranscribeRequest {
 }
 
 /// The answer in one of the formats of PROTOCOL.md 11.4.
+fn words_of(turn: &localrouter_speech::TranscriptTurn, off: f64) -> Vec<Value> {
+    turn.words
+        .iter()
+        .map(|w| json!({ "word": w.word, "start": r3(w.start + off), "end": r3(w.end + off), "probability": r3(w.probability as f64) }))
+        .collect()
+}
+
+/// One segment of `verbose_json` / `lr_speakers_json`, also sent alone when streaming.
+pub fn segment_json(i: usize, turn: &localrouter_speech::TranscriptTurn, format: &str, req: &TranscribeRequest) -> Value {
+    let off = req.offset;
+    let mut s = json!({ "id": i, "start": r3(turn.start + off), "end": r3(turn.end + off), "text": turn.text });
+    if format == "lr_speakers_json" {
+        s["speaker"] = json!(turn.speaker);
+    }
+    if req.words {
+        s["words"] = json!(words_of(turn, off));
+    }
+    s
+}
+
 pub fn render(t: &localrouter_speech::Transcript, format: &str, req: &TranscribeRequest) -> (Value, Option<String>) {
     let off = req.offset;
     let text = t.turns.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join(" ");
-    let words_of = |turn: &localrouter_speech::TranscriptTurn| -> Vec<Value> {
-        turn.words
-            .iter()
-            .map(|w| json!({ "word": w.word, "start": r3(w.start + off), "end": r3(w.end + off), "probability": r3(w.probability as f64) }))
-            .collect()
-    };
-    let segments: Vec<Value> = t
-        .turns
-        .iter()
-        .enumerate()
-        .map(|(i, turn)| {
-            let mut s = json!({ "id": i, "start": r3(turn.start + off), "end": r3(turn.end + off), "text": turn.text });
-            if format == "lr_speakers_json" {
-                s["speaker"] = json!(turn.speaker);
-            }
-            if req.words {
-                s["words"] = json!(words_of(turn));
-            }
-            s
-        })
-        .collect();
+    let segments: Vec<Value> = t.turns.iter().enumerate().map(|(i, turn)| segment_json(i, turn, format, req)).collect();
     match format {
         "text" => (Value::Null, Some(text)),
         "srt" | "vtt" => (Value::Null, Some(subtitles(t, format == "vtt", off))),
@@ -165,7 +210,7 @@ pub fn render(t: &localrouter_speech::Transcript, format: &str, req: &Transcribe
                 "segments": segments,
             });
             if req.words {
-                v["words"] = json!(t.turns.iter().flat_map(words_of).collect::<Vec<_>>());
+                v["words"] = json!(t.turns.iter().flat_map(|turn| words_of(turn, off)).collect::<Vec<_>>());
             }
             if format == "lr_speakers_json" {
                 v["speakers"] = json!(t.speakers.iter().map(|s| json!({ "id": s })).collect::<Vec<_>>());
