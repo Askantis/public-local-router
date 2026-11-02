@@ -46,10 +46,32 @@ impl CacheLocation {
         })
     }
 
+    /// Only the path, without touching the disk. Checking the state can block:
+    /// macOS asks the user before a background process reads a removable drive.
+    pub fn resolve_path() -> PathBuf {
+        Self::path_with(&|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| launchctl_getenv(name))
+        })
+    }
+
+    /// Whether `hub` can be used (may block, see [`resolve_path`](Self::resolve_path)).
+    pub fn check(hub: &Path) -> CacheState {
+        cache_state(hub)
+    }
+
     /// [`resolve`](Self::resolve) with an explicit variable lookup, for tests.
     pub fn resolve_with(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let hub = Self::path_with(lookup);
+        let state = cache_state(&hub);
+        CacheLocation { hub, state }
+    }
+
+    fn path_with(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
         let home = home_dir();
-        let hub = if let Some(hub) = lookup("HF_HUB_CACHE") {
+        if let Some(hub) = lookup("HF_HUB_CACHE") {
             expand(&hub, &home)
         } else if let Some(hf_home) = lookup("HF_HOME") {
             expand(&hf_home, &home).join("hub")
@@ -57,9 +79,7 @@ impl CacheLocation {
             expand(&xdg, &home).join("huggingface").join("hub")
         } else {
             home.join(".cache").join("huggingface").join("hub")
-        };
-        let state = cache_state(&hub);
-        CacheLocation { hub, state }
+        }
     }
 }
 

@@ -814,7 +814,7 @@ components:
           type: object
           properties:
             path: { type: ["string", "null"] }
-            state: { enum: [ok, missing_volume, unwritable] }
+            state: { enum: [ok, missing_volume, unwritable, checking] }
 
     Store:
       enum: [ollama, hf, app]

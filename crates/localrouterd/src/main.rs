@@ -45,12 +45,8 @@ async fn main() -> Result<()> {
     let (tcp4, port) = bind_tcp(first, last).await?;
     let tcp6 = TcpListener::bind(("::1", port)).await.ok();
 
-    let hf = CacheLocation::resolve();
-    let hf_state = match hf.state {
-        CacheState::Ok => "ok",
-        CacheState::MissingVolume => "missing_volume",
-        CacheState::Unwritable => "unwritable",
-    };
+    // Only the path now: checking the drive can wait on a permission prompt.
+    let hub = CacheLocation::resolve_path();
     let ollama_url = std::env::var("LR_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let st: Shared = Arc::new(AppState {
         instance_id: uuid::Uuid::new_v4().to_string(),
@@ -58,8 +54,8 @@ async fn main() -> Result<()> {
         pending: Mutex::new(state::PendingRequests::default()),
         events: events::Events::new(),
         ollama: ollama::Ollama::new(ollama_url.clone()),
-        speech: speech::Speech::new((hf.state == CacheState::Ok).then(|| Cache::new(&hf.hub))),
-        hf: HfCacheInfo { path: Some(hf.hub.display().to_string()), state: hf_state.into() },
+        speech: Arc::new(speech::Speech::new()),
+        hf: RwLock::new(HfCacheInfo { path: Some(hub.display().to_string()), state: "checking".into() }),
         ollama_state: RwLock::new(OllamaInfo { url: ollama_url, state: "stopped".into(), version: None }),
         resident: Mutex::new(Default::default()),
         shutdown: tokio::sync::Notify::new(),
@@ -85,13 +81,36 @@ async fn main() -> Result<()> {
         started_at: localrouter_core::now_rfc3339(),
         http: format!("http://127.0.0.1:{port}"),
         socket: Some(socket_path.display().to_string()),
-        hf_cache: st.hf.clone(),
+        hf_cache: st.hf.read().unwrap().clone(),
         ollama: st.ollama_state.read().unwrap().clone(),
         capabilities: app::CAPABILITIES.iter().map(|s| s.to_string()).collect(),
     };
     let endpoint_path = localrouter_core::endpoint_path();
     endpoint.write_atomic(&endpoint_path)?;
     eprintln!("localrouterd {} ready: {} and {}", env!("CARGO_PKG_VERSION"), socket_path.display(), endpoint.http);
+
+    // Check the Hugging Face cache off the main path, then announce the result.
+    tokio::spawn({
+        let st = st.clone();
+        let endpoint_path = endpoint_path.clone();
+        async move {
+            let hub2 = hub.clone();
+            let state = tokio::task::spawn_blocking(move || CacheLocation::check(&hub2)).await.unwrap_or(CacheState::Unwritable);
+            let name = match state {
+                CacheState::Ok => "ok",
+                CacheState::MissingVolume => "missing_volume",
+                CacheState::Unwritable => "unwritable",
+            };
+            st.speech.set_cache((state == CacheState::Ok).then(|| Cache::new(&hub)));
+            let info = HfCacheInfo { path: Some(hub.display().to_string()), state: name.into() };
+            *st.hf.write().unwrap() = info.clone();
+            if let Ok(mut ep) = Endpoint::read(&endpoint_path) {
+                ep.hf_cache = info.clone();
+                let _ = ep.write_atomic(&endpoint_path);
+            }
+            st.events.send("hf_cache.state", serde_json::to_value(&info).unwrap(), Audience::Everyone);
+        }
+    });
 
     tokio::spawn({
         let st = st.clone();

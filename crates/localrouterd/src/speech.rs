@@ -5,11 +5,14 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use localrouter_hf::Cache;
+
 use localrouter_speech::{Asr, AsrOptions, Audio, Diarizer, Strategy, Turn, catalog};
 use serde_json::{Value, json};
 
 pub struct Speech {
-    cache: Option<Cache>,
+    /// Set once the Hugging Face cache has been checked (that can wait for the
+    /// user to allow access to a removable drive).
+    cache: std::sync::RwLock<Option<Cache>>,
     asr: Mutex<Option<(String, Arc<Asr>)>>,
     diarizer: Mutex<Option<Diarizer>>,
     /// One job at a time: the GPU and memory are shared.
@@ -17,13 +20,22 @@ pub struct Speech {
 }
 
 impl Speech {
-    pub fn new(cache: Option<Cache>) -> Self {
-        Speech { cache, asr: Mutex::new(None), diarizer: Mutex::new(None), job: tokio::sync::Mutex::new(()) }
+    pub fn new() -> Self {
+        Speech { cache: std::sync::RwLock::new(None), asr: Mutex::new(None), diarizer: Mutex::new(None), job: tokio::sync::Mutex::new(()) }
+    }
+
+    pub fn set_cache(&self, cache: Option<Cache>) {
+        *self.cache.write().unwrap() = cache;
+    }
+
+    fn cache(&self) -> Option<Cache> {
+        self.cache.read().unwrap().clone()
     }
 
     /// Speech models present in the cache: `(model id, capability, display name, bytes)`.
     pub fn installed(&self) -> Vec<(String, localrouter_core::Capability, String, u64)> {
-        let Some(cache) = &self.cache else { return vec![] };
+        let Some(cache) = self.cache() else { return vec![] };
+        let cache = &cache;
         let mut out = Vec::new();
         for m in catalog::WHISPER_MODELS {
             if let Ok(Some(path)) = catalog::whisper_present(cache, *m) {
@@ -43,9 +55,9 @@ impl Speech {
             && id == model_id {
                 return Ok(asr.clone());
             }
-        let cache = self.cache.as_ref().context("the Hugging Face cache isn't available")?;
+        let cache = self.cache().context("the Hugging Face cache isn't available")?;
         let model = catalog::whisper_by_model_id(model_id).context("not a speech model Local Router knows")?;
-        let path = catalog::whisper_present(cache, model)?.context("model isn't downloaded")?;
+        let path = catalog::whisper_present(&cache, model)?.context("model isn't downloaded")?;
         // Free the old model before loading the new one.
         *slot = None;
         let asr = Arc::new(Asr::load(&path, catalog::aheads_for(&model))?);
@@ -56,8 +68,8 @@ impl Speech {
     fn with_diarizer<T>(&self, f: impl FnOnce(&mut Diarizer) -> Result<T>) -> Result<T> {
         let mut slot = self.diarizer.lock().unwrap();
         if slot.is_none() {
-            let cache = self.cache.as_ref().context("the Hugging Face cache isn't available")?;
-            let dir = catalog::speaker_models_present(cache)?.context("speaker models aren't downloaded")?;
+            let cache = self.cache().context("the Hugging Face cache isn't available")?;
+            let dir = catalog::speaker_models_present(&cache)?.context("speaker models aren't downloaded")?;
             *slot = Some(Diarizer::load(&dir)?);
         }
         f(slot.as_mut().unwrap())

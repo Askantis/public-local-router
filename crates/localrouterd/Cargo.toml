@@ -10,6 +10,9 @@ rust-version.workspace = true
 [features]
 # Lets every caller use the admin endpoints. Only for integration tests; never in a release build.
 test-admin = []
+# Accepts an ad-hoc signed Local Router (identifier ch.askantis.localrouter) as
+# admin, for development builds made without a Developer ID. Never in a release.
+dev-admin = []
 
 [dependencies]
 anyhow.workspace = true

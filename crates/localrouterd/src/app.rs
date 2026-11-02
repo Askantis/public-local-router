@@ -43,8 +43,8 @@ pub struct AppState {
     pub pending: Mutex<PendingRequests>,
     pub events: Events,
     pub ollama: Ollama,
-    pub speech: Speech,
-    pub hf: HfCacheInfo,
+    pub speech: Arc<Speech>,
+    pub hf: RwLock<HfCacheInfo>,
     pub ollama_state: RwLock<OllamaInfo>,
     /// Models apps run themselves: approval key → (models, lease end).
     pub resident: Mutex<HashMap<String, Resident>>,
@@ -52,6 +52,12 @@ pub struct AppState {
 }
 
 pub type Shared = Arc<AppState>;
+
+impl AppState {
+    pub fn speech_handle(&self) -> Arc<Speech> {
+        self.speech.clone()
+    }
+}
 pub type Resident = (Vec<Value>, Instant);
 
 // ─── Who is calling ─────────────────────────────────────────────────────────
@@ -134,7 +140,11 @@ fn connected(st: &AppState, caller: &Caller) -> Result<String, ApiError> {
 
 fn is_admin(caller: &Caller) -> bool {
     match caller {
-        Caller::Socket(id) => cfg!(feature = "test-admin") || id.is_local_router(BUNDLE_ID, ASKANTIS_TEAM),
+        Caller::Socket(id) => {
+            cfg!(feature = "test-admin")
+                || id.is_local_router(BUNDLE_ID, ASKANTIS_TEAM)
+                || (cfg!(feature = "dev-admin") && id.identifier.as_deref() == Some(BUNDLE_ID))
+        }
         Caller::Tcp(_) => false,
     }
 }
@@ -245,8 +255,18 @@ async fn health(State(st): State<Shared>) -> Json<Health> {
         instance_id: st.instance_id.clone(),
         capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
         ollama: st.ollama_state.read().unwrap().clone(),
-        hf_cache: st.hf.clone(),
+        hf_cache: st.hf.read().unwrap().clone(),
     })
+}
+
+/// Speech models in the cache. Reading the disk can block (a removable drive
+/// waiting for the user's permission), so it never runs on an async thread.
+async fn installed_speech(st: &AppState) -> Vec<(String, Capability, String, u64)> {
+    if st.hf.read().unwrap().state != "ok" {
+        return vec![];
+    }
+    let speech = st.speech_handle();
+    tokio::task::spawn_blocking(move || speech.installed()).await.unwrap_or_default()
 }
 
 struct Inventory {
@@ -259,7 +279,7 @@ impl Inventory {
     async fn get(st: &AppState) -> Inventory {
         let ollama = st.ollama.models().await.unwrap_or_default();
         let loaded = st.ollama.loaded().await;
-        Inventory { ollama, loaded, speech: st.speech.installed() }
+        Inventory { ollama, loaded, speech: installed_speech(st).await }
     }
 
     fn candidates(&self) -> Vec<Candidate> {
@@ -764,7 +784,7 @@ async fn speech_model(st: &AppState, key: &str, requested: &str, role: &str) -> 
         m => m.to_string(),
     };
     let (id, _) = resolve_model(st, key, &model).await?;
-    let known = st.speech.installed().iter().any(|(m, ..)| m == &id);
+    let known = installed_speech(st).await.iter().any(|(m, ..)| m == &id);
     if !known {
         return Err(if localrouter_speech::catalog::whisper_by_model_id(&id).is_some() {
             ApiError::model_not_downloaded(&id)
@@ -830,7 +850,7 @@ async fn transcriptions(State(st): State<Shared>, caller: Caller, mp: Multipart)
         None => None,
     };
     let diarize = segments.is_none() && (format == "lr_speakers_json" || up.flag("lr_diarize"));
-    if diarize && !st.speech.installed().iter().any(|(_, c, ..)| *c == Capability::Diarization) {
+    if diarize && !installed_speech(&st).await.iter().any(|(_, c, ..)| *c == Capability::Diarization) {
         return Err(ApiError::model_not_downloaded(&localrouter_speech::catalog::speaker_model_id()).into());
     }
     let req = TranscribeRequest {
