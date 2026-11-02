@@ -40,14 +40,25 @@ impl Audio {
 /// Read `path` and return 16 kHz mono samples.
 pub fn decode_file(path: &Path) -> Result<Audio> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_owned);
+    decode(MediaSourceStream::new(Box::new(file), Default::default()), ext.as_deref())
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+/// Decode audio held in memory (an upload). `ext` is a hint such as "m4a".
+/// Nothing is written to disk.
+pub fn decode_bytes(bytes: Vec<u8>, ext: Option<&str>) -> Result<Audio> {
+    decode(MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default()), ext)
+}
+
+fn decode(mss: MediaSourceStream, ext: Option<&str>) -> Result<Audio> {
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = ext {
         hint.with_extension(ext);
     }
     let mut format = symphonia::default::get_probe()
         .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
-        .with_context(|| format!("{} isn't an audio format we can read", path.display()))?;
+        .context("this isn't an audio format we can read")?;
     let track = format
         .default_track(TrackType::Audio)
         .context("the file has no audio track")?;
@@ -132,6 +143,34 @@ mod tests {
         // Count zero crossings: 440 Hz → ~880 per second.
         let crossings = out.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
         assert!((860..=900).contains(&crossings), "{crossings} crossings");
+    }
+
+    #[test]
+    fn decodes_a_wav_from_memory() {
+        // 0.5 s of 16-bit mono silence with a 440 Hz burst, as a WAV file in memory.
+        let n = 8_000u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + n * 2).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(n * 2).to_le_bytes());
+        for i in 0..n {
+            let s = ((i as f32 * 440.0 * std::f32::consts::TAU / 16_000.0).sin() * 8_000.0) as i16;
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let audio = decode_bytes(wav, Some("wav")).unwrap();
+        assert_eq!(audio.samples.len(), n as usize);
+        assert!((audio.duration_s() - 0.5).abs() < 1e-9);
+        assert!(audio.samples.iter().any(|&s| s.abs() > 0.2));
+        assert!(decode_bytes(b"not audio".to_vec(), None).is_err());
     }
 
     #[test]

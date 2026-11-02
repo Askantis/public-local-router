@@ -35,7 +35,52 @@ pub const WHISPER_TURBO_F16: WhisperModel = WhisperModel {
     approx_bytes: 1_624_000_000,
 };
 
-pub const WHISPER_MODELS: &[WhisperModel] = &[WHISPER_TURBO_Q8, WHISPER_TURBO_F16];
+/// Askantis' Swiss-German model (Whisper large-v3-turbo, LoRA-merged), private.
+/// Its ggml files are added to the private Hugging Face repository; apps that
+/// may use it download them through a mirror (PROTOCOL.md 8.1).
+pub const GRUEZI_Q8: WhisperModel = WhisperModel {
+    id: "gruezi-v1-q8_0",
+    display_name: "Grüezi (Swiss German)",
+    repo: "askantis/gruezi-v1",
+    file: "ggml-model-q8_0.bin",
+    revision: "main",
+    approx_bytes: 874_000_000,
+};
+
+pub const GRUEZI_F16: WhisperModel = WhisperModel {
+    id: "gruezi-v1",
+    display_name: "Grüezi (Swiss German, full precision)",
+    repo: "askantis/gruezi-v1",
+    file: "ggml-model.bin",
+    revision: "main",
+    approx_bytes: 1_625_000_000,
+};
+
+pub const WHISPER_MODELS: &[WhisperModel] = &[WHISPER_TURBO_Q8, WHISPER_TURBO_F16, GRUEZI_Q8, GRUEZI_F16];
+
+/// DTW alignment heads for a catalog model.
+pub fn aheads_for(model: &WhisperModel) -> crate::Aheads {
+    if model.repo == "askantis/gruezi-v1" {
+        // From the model's generation_config.json (the turbo heads; the LoRA
+        // left them usable: 67 ms median word-start error in bench/RESULTS.md).
+        crate::Aheads::Custom(vec![(2, 4), (2, 11), (3, 3), (3, 6), (3, 11), (3, 14)])
+    } else {
+        crate::Aheads::LargeV3Turbo
+    }
+}
+
+/// The catalog model a `hf:` model id names.
+pub fn whisper_by_model_id(model_id: &str) -> Option<WhisperModel> {
+    WHISPER_MODELS.iter().copied().find(|m| format!("hf:{}/{}", m.repo, m.file) == model_id)
+}
+
+pub fn whisper_model_id(model: &WhisperModel) -> String {
+    format!("hf:{}/{}", model.repo, model.file)
+}
+
+pub fn speaker_model_id() -> String {
+    format!("hf:{SPEAKER_REPO}")
+}
 
 pub fn whisper_model(id: &str) -> Option<WhisperModel> {
     WHISPER_MODELS.iter().copied().find(|m| m.id == id)

@@ -1,0 +1,38 @@
+[package]
+name = "localrouterd"
+description = "Local Router's background service: the Local Router Protocol over a Unix socket and loopback TCP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Lets every caller use the admin endpoints. Only for integration tests; never in a release build.
+test-admin = []
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
+time.workspace = true
+localrouter-core.workspace = true
+localrouter-identity.workspace = true
+localrouter-hf.workspace = true
+localrouter-audio.workspace = true
+localrouter-speech.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true

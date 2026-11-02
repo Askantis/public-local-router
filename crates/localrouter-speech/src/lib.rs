@@ -86,15 +86,30 @@ pub fn transcribe_with(
     strategy: Strategy,
     progress: Progress<'_>,
 ) -> Result<Transcript> {
-    let duration = audio.duration_s();
     let speaker_turns = match diarizer {
         Some(d) => Some(merge_same_speaker(&label_speakers(d.run(&audio.samples)?))),
         None => None,
     };
+    transcribe_turns(audio, asr, speaker_turns, opts, strategy, progress)
+}
+
+/// Transcribe with speaker turns that are already known, for example from an
+/// app that separated speakers itself (PROTOCOL.md `lr_segments`). Without
+/// turns the whole file is transcribed as "Speaker 1".
+pub fn transcribe_turns(
+    audio: &Audio,
+    asr: &Asr,
+    speaker_turns: Option<Vec<Turn>>,
+    opts: &AsrOptions,
+    strategy: Strategy,
+    progress: Progress<'_>,
+) -> Result<Transcript> {
+    let duration = audio.duration_s();
     if strategy == Strategy::Windows
         && let Some(turns) = speaker_turns {
             return transcribe_windows(audio, asr, &turns, opts, progress);
         }
+    let diarized = speaker_turns.is_some();
     let turns = match speaker_turns {
         Some(t) => split_long(&t),
         None => fixed_windows(duration),
@@ -112,6 +127,17 @@ pub fn transcribe_with(
             eprintln!("TURN\t{i}\t{start:.3}\t{end:.3}\t{}", turn.speaker);
         }
         let segments = asr.transcribe(audio.slice(start, end), start, opts)?;
+        if !diarized {
+            // No speakers: keep Whisper's own segments (sentence-like), and
+            // drop the overlap of consecutive windows.
+            let from = out.last().map(|t: &TranscriptTurn| t.end).unwrap_or(0.0);
+            for s in segments.into_iter().filter(|s| !s.text.trim().is_empty() && s.end > from + 0.05) {
+                let words: Vec<Word> = s.words.into_iter().filter(|w| w.start >= from).collect();
+                let text = if words.is_empty() { s.text.trim().to_string() } else { join_text(words.iter().map(|w| w.word.as_str())) };
+                out.push(TranscriptTurn { start: s.start.max(from), end: s.end, speaker: turn.speaker.clone(), text, words });
+            }
+            continue;
+        }
         let text = join_text(segments.iter().map(|s| s.text.as_str()));
         if text.is_empty() {
             continue;
