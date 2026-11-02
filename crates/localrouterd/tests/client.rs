@@ -79,8 +79,21 @@ async fn embedded_and_connected_agree() {
     let audio = std::fs::read(&wav).expect("run bench/synth.py bench/out first");
     let opts = TranscribeOptions { language: Some("de".into()), ..Default::default() };
     let engine = localrouter_client::embedded::Engine::new(localrouter_speech::catalog::WHISPER_TURBO_Q8).unwrap();
-    let embedded = LocalAi::Embedded(engine).transcribe(audio.clone(), "words.wav", &opts).await.unwrap();
+    assert!(engine.ready(false));
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let embedded = LocalAi::Embedded(engine)
+        .transcribe_with_progress(audio.clone(), "words.wav", &opts, move |e| sink.lock().unwrap().push(e))
+        .await
+        .unwrap();
     assert!(embedded.text.contains("Guten Morgen"), "{}", embedded.text);
+    let events = events.lock().unwrap();
+    use localrouter_client::TranscribeEvent as E;
+    assert_eq!(events[0], E::Phase("decode"));
+    assert!(events.contains(&E::Phase("transcribe")));
+    let streamed: Vec<_> = events.iter().filter_map(|e| if let E::Segment(s) = e { Some(s.clone()) } else { None }).collect();
+    assert_eq!(streamed, embedded.segments, "every segment arrives once, as final");
+    assert!(events.iter().any(|e| matches!(e, E::Fraction(f) if *f >= 1.0)));
     assert!(embedded.segments.iter().all(|s| s.speaker.is_none()));
     assert!(embedded.segments.iter().flat_map(|s| &s.words).count() >= 30);
 }
