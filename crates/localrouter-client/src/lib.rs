@@ -482,6 +482,18 @@ impl Client {
     }
 }
 
+/// What a transcription is doing, for progress in the app.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscribeEvent {
+    /// `decode`, `speakers` or `transcribe` (embedded only; Local Router
+    /// does these steps on its side).
+    Phase(&'static str),
+    /// 0.0 to 1.0 of the current phase, when it's known.
+    Fraction(f64),
+    /// A finished segment; segments arrive in order and don't change later.
+    Segment(TranscriptSegment),
+}
+
 /// One way to run speech in an app, with or without Local Router.
 #[allow(clippy::large_enum_variant)] // one per app
 pub enum LocalAi {
@@ -499,6 +511,32 @@ impl LocalAi {
                 let e = e.clone();
                 let (filename, opts) = (filename.to_string(), opts.clone());
                 tokio::task::spawn_blocking(move || e.transcribe(audio, &filename, &opts))
+                    .await
+                    .map_err(|e| Error::Other(e.to_string()))?
+            }
+        }
+    }
+
+    /// [`LocalAi::transcribe`] with progress: phases, fractions and each
+    /// segment as soon as it's final.
+    pub async fn transcribe_with_progress(
+        &self,
+        audio: Vec<u8>,
+        filename: &str,
+        opts: &TranscribeOptions,
+        on_event: impl FnMut(TranscribeEvent) + Send + 'static,
+    ) -> Result<Transcript> {
+        let mut on_event = on_event;
+        match self {
+            LocalAi::Connected(c) => {
+                on_event(TranscribeEvent::Phase("transcribe"));
+                c.transcribe_streaming(audio, filename, opts, move |s| on_event(TranscribeEvent::Segment(s))).await
+            }
+            #[cfg(feature = "embedded")]
+            LocalAi::Embedded(e) => {
+                let e = e.clone();
+                let (filename, opts) = (filename.to_string(), opts.clone());
+                tokio::task::spawn_blocking(move || e.transcribe_with_progress(audio, &filename, &opts, &mut on_event))
                     .await
                     .map_err(|e| Error::Other(e.to_string()))?
             }
@@ -548,6 +586,24 @@ pub mod embedded {
         }
 
         pub fn transcribe(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> Result<Transcript> {
+            self.transcribe_with_progress(audio, filename, opts, &mut |_| {})
+        }
+
+        /// Whether the models this engine needs are in the cache.
+        pub fn ready(&self, speakers: bool) -> bool {
+            let g = self.inner.lock().unwrap();
+            let asr = matches!(catalog::whisper_present(&g.cache, g.whisper), Ok(Some(_)));
+            asr && (!speakers || matches!(catalog::speaker_models_present(&g.cache), Ok(Some(_))))
+        }
+
+        pub fn transcribe_with_progress(
+            &self,
+            audio: Vec<u8>,
+            filename: &str,
+            opts: &TranscribeOptions,
+            on_event: &mut (dyn FnMut(TranscribeEvent) + Send),
+        ) -> Result<Transcript> {
+            on_event(TranscribeEvent::Phase("decode"));
             let ext = filename.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
             let audio = localrouter_audio::decode_bytes(audio, ext.as_deref()).map_err(|e| Error::Other(format!("{e:#}")))?;
             let mut g = self.inner.lock().unwrap();
@@ -561,6 +617,7 @@ pub mod embedded {
             let turns: Option<Vec<Turn>> = match (&opts.segments, opts.speakers) {
                 (Some(s), _) => Some(s.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone().unwrap_or_else(|| "S1".into()) }).collect()),
                 (None, true) => {
+                    on_event(TranscribeEvent::Phase("speakers"));
                     if inner.diarizer.is_none() {
                         let dir = catalog::speaker_models_present(&inner.cache)
                             .map_err(|e| Error::Other(e.to_string()))?
@@ -572,34 +629,47 @@ pub mod embedded {
                 }
                 (None, false) => None,
             };
+            on_event(TranscribeEvent::Phase("transcribe"));
             let asr_opts = AsrOptions { language: opts.language.clone(), prompt: opts.prompt.clone(), threads: 0 };
-            let t = localrouter_speech::transcribe_turns(&audio, inner.asr.as_ref().unwrap(), turns, &asr_opts, Strategy::Windows, &mut |_, _| {})
-                .map_err(|e| Error::Other(format!("{e:#}")))?;
-            let label = |s: &str| s.strip_prefix("Speaker ").map(|n| format!("S{n}")).unwrap_or_else(|| s.to_string());
             let with_speakers = opts.speakers || opts.segments.is_some();
+            let offset = opts.offset;
+            let segment = |x: &localrouter_speech::TranscriptTurn| TranscriptSegment {
+                start: x.start + offset,
+                end: x.end + offset,
+                speaker: with_speakers.then(|| short_label(&x.speaker)),
+                text: x.text.clone(),
+                words: x
+                    .words
+                    .iter()
+                    .map(|w| Word { word: w.word.clone(), start: w.start + offset, end: w.end + offset, probability: w.probability as f64 })
+                    .collect(),
+            };
+            let events = std::cell::RefCell::new(on_event);
+            let t = localrouter_speech::transcribe_turns_streaming(
+                &audio,
+                inner.asr.as_ref().unwrap(),
+                turns,
+                &asr_opts,
+                Strategy::Windows,
+                &mut |done, total| (events.borrow_mut())(TranscribeEvent::Fraction(if total == 0 { 1.0 } else { done as f64 / total as f64 })),
+                &mut |turn| (events.borrow_mut())(TranscribeEvent::Segment(segment(turn))),
+            )
+            .map_err(|e| Error::Other(format!("{e:#}")))?;
             Ok(Transcript {
                 language: t.language.clone().unwrap_or_default(),
                 duration: t.duration_s,
                 text: t.turns.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join(" "),
-                segments: t
-                    .turns
-                    .iter()
-                    .map(|x| TranscriptSegment {
-                        start: x.start + opts.offset,
-                        end: x.end + opts.offset,
-                        speaker: with_speakers.then(|| label(&x.speaker)),
-                        text: x.text.clone(),
-                        words: x
-                            .words
-                            .iter()
-                            .map(|w| Word { word: w.word.clone(), start: w.start + opts.offset, end: w.end + opts.offset, probability: w.probability as f64 })
-                            .collect(),
-                    })
-                    .collect(),
+                segments: t.turns.iter().map(segment).collect(),
                 model: Some(catalog::whisper_model_id(&inner.whisper)),
             })
         }
     }
+
+    /// "Speaker 3" → "S3", as Local Router labels them.
+    fn short_label(s: &str) -> String {
+        s.strip_prefix("Speaker ").map(|n| format!("S{n}")).unwrap_or_else(|| s.to_string())
+    }
+
 }
 
 #[cfg(test)]
