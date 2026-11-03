@@ -566,7 +566,16 @@ Speakers are numbered `S1`, `S2`, … in the order they first speak. Naming them
 | `transcript.text.done` | `{ "type", … }`: the complete response, in the requested format |
 | `error` | `{ "type": "error", "error": { … } }`: the error object of section 12; the stream then ends |
 
-**Live transcription** is a series of short requests. The app records the audio itself, so the microphone permission belongs to the app. Every few seconds it sends the newest stretch of audio, up to 30 seconds, as WAV with `lr_priority=live` and `lr_offset` set to where that stretch starts in the recording. Windows MAY overlap; the app keeps the words with the latest start time for each moment. Version 1 has no session API, and separating speakers in live mode is left to a later version.
+**Live transcription** is a series of short requests. The app records the audio itself, so the microphone permission belongs to the app. Every few seconds it sends the newest stretch of audio, up to 30 seconds, as WAV with `lr_priority=live` and `lr_offset` set to where that stretch starts in the recording. Windows MAY overlap. Version 1 has no session API, and separating speakers in live mode is left to a later version.
+
+An app SHOULD merge the windows like this, so the text on screen only ever grows at the end:
+- The words before the *committed point* are final and never change. Everything after it is tentative and is replaced by the next window that covers it.
+- A tentative word becomes committed when two consecutive windows agree on it (same word, start within 0.3 s), when 1.5 s of silence follows it, or when it is more than 15 s behind the end of the recording.
+- Each new window starts about 1 s before the committed point, so the first words of the tentative part get context. Words of the window that end before the committed point are dropped.
+- Segments with a `no_speech_prob` above 0.6 and an average word probability below 0.5 are usually invented over silence; the app SHOULD drop them, along with well-known silence phrases.
+- The app MAY send the last ~200 characters of committed text as `prompt`, and SHOULD pin `language` once it has heard a few seconds of speech, so windows don't switch languages.
+
+When the recording stops, the app SHOULD transcribe the whole file once more (with speakers if it wants them); live text is a preview.
 
 ### 11.5 Speaker diarization
 

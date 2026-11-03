@@ -482,6 +482,115 @@ impl Client {
     }
 }
 
+/// One segment of a live window (PROTOCOL.md 11.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowSegment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    #[serde(default)]
+    pub words: Vec<Word>,
+    /// How sure Whisper is that nothing was said; high values are usually
+    /// made-up text over silence.
+    #[serde(default)]
+    pub no_speech_prob: Option<f32>,
+}
+
+/// What a live window said: segments in the recording's timeline (the
+/// window's offset is added) and the language Whisper heard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowResult {
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub segments: Vec<WindowSegment>,
+}
+
+/// Keeps a model loaded in Local Router while it lives: renews the hold,
+/// and lets go when dropped (PROTOCOL.md 7.2).
+pub struct HoldGuard {
+    client: Client,
+    model: String,
+    renew: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        self.renew.abort();
+        let (client, model) = (self.client.clone(), self.model.clone());
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = client.release(&model).await;
+            });
+        }
+    }
+}
+
+impl Client {
+    /// A live window: mono 16 kHz samples, sent as WAV with
+    /// `lr_priority=live` (unless `opts.priority` says otherwise) and
+    /// `lr_offset`, answered as `verbose_json` with word times.
+    pub async fn transcribe_window(&self, samples: &[f32], opts: &TranscribeOptions) -> Result<WindowResult> {
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", reqwest::multipart::Part::bytes(wav_pcm16(samples, 16_000)).file_name("window.wav"))
+            .text("model", opts.model.clone().unwrap_or_else(|| "localrouter/transcribe".into()))
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "word")
+            .text("timestamp_granularities[]", "segment")
+            .text("lr_priority", opts.priority.clone().unwrap_or_else(|| "live".into()));
+        if let Some(l) = &opts.language {
+            form = form.text("language", l.clone());
+        }
+        if let Some(p) = &opts.prompt {
+            form = form.text("prompt", p.clone());
+        }
+        if opts.offset != 0.0 {
+            form = form.text("lr_offset", opts.offset.to_string());
+        }
+        let v: Value = self.json(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
+        let language = v["language"].as_str().filter(|l| !l.is_empty()).map(str::to_owned);
+        let segments = serde_json::from_value(v["segments"].clone()).map_err(|e| Error::Other(e.to_string()))?;
+        Ok(WindowResult { language, segments })
+    }
+
+    /// Hold `model` now, renew the hold every `renew_every`, release it when
+    /// the guard is dropped.
+    pub async fn keep_held(&self, model: &str, keep_alive: &str, renew_every: Duration) -> Result<HoldGuard> {
+        self.hold(model, None, Some(keep_alive)).await?;
+        let (client, m, k) = (self.clone(), model.to_string(), keep_alive.to_string());
+        let renew = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(renew_every).await;
+                let _ = client.hold(&m, None, Some(&k)).await;
+            }
+        });
+        Ok(HoldGuard { client: self.clone(), model: model.to_string(), renew })
+    }
+}
+
+/// Mono samples as 16-bit PCM WAV (kept here so the client stays light;
+/// `localrouter_audio::wav_i16` is the same for apps that have it).
+fn wav_pcm16(samples: &[f32], rate: u32) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    for part in [&b"RIFF"[..], &(36 + data_len).to_le_bytes(), b"WAVEfmt ", &16u32.to_le_bytes(), &1u16.to_le_bytes(), &1u16.to_le_bytes(),
+        &rate.to_le_bytes(), &(rate * 2).to_le_bytes(), &2u16.to_le_bytes(), &16u16.to_le_bytes(), b"data", &data_len.to_le_bytes()]
+    {
+        wav.extend_from_slice(part);
+    }
+    for &s in samples {
+        wav.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+    }
+    wav
+}
+
+/// Ready for live windows: a hold in Local Router, or the model loaded in the app.
+#[allow(clippy::large_enum_variant)] // one per recording
+pub enum LiveReady {
+    Held(HoldGuard),
+    Loaded,
+}
+
 /// What a transcription is doing, for progress in the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscribeEvent {
@@ -496,6 +605,7 @@ pub enum TranscribeEvent {
 
 /// One way to run speech in an app, with or without Local Router.
 #[allow(clippy::large_enum_variant)] // one per app
+#[derive(Clone)]
 pub enum LocalAi {
     Connected(Client),
     #[cfg(feature = "embedded")]
@@ -546,6 +656,33 @@ impl LocalAi {
     pub fn is_connected(&self) -> bool {
         matches!(self, LocalAi::Connected(_))
     }
+
+    /// Get the speech model ready before recording starts: held in Local
+    /// Router (so live windows don't wait behind other work), or loaded here.
+    pub async fn prepare_live(&self) -> Result<LiveReady> {
+        match self {
+            LocalAi::Connected(c) => Ok(LiveReady::Held(c.keep_held("localrouter/transcribe", "30m", Duration::from_secs(10 * 60)).await?)),
+            #[cfg(feature = "embedded")]
+            LocalAi::Embedded(e) => {
+                let e = e.clone();
+                tokio::task::spawn_blocking(move || e.preload()).await.map_err(|e| Error::Other(e.to_string()))??;
+                Ok(LiveReady::Loaded)
+            }
+        }
+    }
+
+    /// One live window (≤ 30 s of mono 16 kHz audio); `opts.offset` is
+    /// where it starts in the recording.
+    pub async fn transcribe_window(&self, samples: std::sync::Arc<[f32]>, opts: &TranscribeOptions) -> Result<WindowResult> {
+        match self {
+            LocalAi::Connected(c) => c.transcribe_window(&samples, opts).await,
+            #[cfg(feature = "embedded")]
+            LocalAi::Embedded(e) => {
+                let (e, opts) = (e.clone(), opts.clone());
+                tokio::task::spawn_blocking(move || e.transcribe_window(&samples, &opts)).await.map_err(|e| Error::Other(e.to_string()))?
+            }
+        }
+    }
 }
 
 /// The capabilities a manifest's roles need; handy for onboarding copy.
@@ -566,14 +703,22 @@ pub mod embedded {
 
     #[derive(Clone)]
     pub struct Engine {
-        inner: Arc<Mutex<Inner>>,
+        inner: Arc<Inner>,
     }
 
     struct Inner {
         cache: localrouter_hf::Cache,
         whisper: catalog::WhisperModel,
-        asr: Option<Asr>,
-        diarizer: Option<Diarizer>,
+        /// Locked only to load or drop the model; Whisper's own state lock
+        /// is taken per window, so a live window runs between a file's windows.
+        asr: Mutex<Option<Arc<Asr>>>,
+        diarizer: Mutex<Option<Diarizer>>,
+        /// One file at a time; live windows don't wait for it (PROTOCOL.md 11.4).
+        job: Mutex<()>,
+    }
+
+    fn err(e: impl std::fmt::Display) -> Error {
+        Error::Other(e.to_string())
     }
 
     impl Engine {
@@ -582,7 +727,9 @@ pub mod embedded {
         /// [`catalog::ensure_speaker_models`] first.
         pub fn new(whisper: catalog::WhisperModel) -> anyhow::Result<Self> {
             let cache = localrouter_hf::Cache::standard()?;
-            Ok(Engine { inner: Arc::new(Mutex::new(Inner { cache, whisper, asr: None, diarizer: None })) })
+            Ok(Engine {
+                inner: Arc::new(Inner { cache, whisper, asr: Mutex::new(None), diarizer: Mutex::new(None), job: Mutex::new(()) }),
+            })
         }
 
         pub fn transcribe(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> Result<Transcript> {
@@ -591,9 +738,58 @@ pub mod embedded {
 
         /// Whether the models this engine needs are in the cache.
         pub fn ready(&self, speakers: bool) -> bool {
-            let g = self.inner.lock().unwrap();
-            let asr = matches!(catalog::whisper_present(&g.cache, g.whisper), Ok(Some(_)));
-            asr && (!speakers || matches!(catalog::speaker_models_present(&g.cache), Ok(Some(_))))
+            let asr = matches!(catalog::whisper_present(&self.inner.cache, self.inner.whisper), Ok(Some(_)));
+            asr && (!speakers || matches!(catalog::speaker_models_present(&self.inner.cache), Ok(Some(_))))
+        }
+
+        /// The speech model, loaded on first use.
+        fn asr(&self) -> Result<Arc<Asr>> {
+            let mut slot = self.inner.asr.lock().unwrap();
+            if let Some(asr) = slot.as_ref() {
+                return Ok(asr.clone());
+            }
+            let w = self.inner.whisper;
+            let path = catalog::whisper_present(&self.inner.cache, w).map_err(err)?.ok_or_else(|| err(format!("{} isn't downloaded", w.id)))?;
+            let asr = Arc::new(Asr::load(&path, catalog::aheads_for(&w)).map_err(|e| err(format!("{e:#}")))?);
+            *slot = Some(asr.clone());
+            Ok(asr)
+        }
+
+        /// Load the speech model now, so the first window doesn't wait for it.
+        pub fn preload(&self) -> Result<()> {
+            self.asr().map(|_| ())
+        }
+
+        pub fn is_loaded(&self) -> bool {
+            self.inner.asr.lock().unwrap().is_some()
+        }
+
+        /// Free the models' memory (once any running work is done with them).
+        pub fn unload(&self) {
+            *self.inner.asr.lock().unwrap() = None;
+            *self.inner.diarizer.lock().unwrap() = None;
+        }
+
+        /// One live window: mono 16 kHz samples, at most 30 s. Speakers are
+        /// ignored (live mode has none); `opts.offset` is added to every time.
+        pub fn transcribe_window(&self, samples: &[f32], opts: &TranscribeOptions) -> Result<WindowResult> {
+            let asr = self.asr()?;
+            let asr_opts = AsrOptions { language: opts.language.clone(), prompt: opts.prompt.clone(), threads: 0 };
+            let out = asr.transcribe_full(samples, opts.offset, &asr_opts).map_err(|e| err(format!("{e:#}")))?;
+            Ok(WindowResult {
+                language: out.language,
+                segments: out
+                    .segments
+                    .into_iter()
+                    .map(|s| WindowSegment {
+                        start: s.start,
+                        end: s.end,
+                        text: s.text,
+                        words: s.words.into_iter().map(|w| Word { word: w.word, start: w.start, end: w.end, probability: w.probability as f64 }).collect(),
+                        no_speech_prob: Some(s.no_speech_prob),
+                    })
+                    .collect(),
+            })
         }
 
         pub fn transcribe_with_progress(
@@ -603,28 +799,24 @@ pub mod embedded {
             opts: &TranscribeOptions,
             on_event: &mut (dyn FnMut(TranscribeEvent) + Send),
         ) -> Result<Transcript> {
+            // Files take turns; a live request goes between their windows.
+            let _job = (opts.priority.as_deref() != Some("live")).then(|| self.inner.job.lock().unwrap_or_else(|e| e.into_inner()));
             on_event(TranscribeEvent::Phase("decode"));
             let ext = filename.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-            let audio = localrouter_audio::decode_bytes(audio, ext.as_deref()).map_err(|e| Error::Other(format!("{e:#}")))?;
-            let mut g = self.inner.lock().unwrap();
-            let inner = &mut *g;
-            if inner.asr.is_none() {
-                let path = catalog::whisper_present(&inner.cache, inner.whisper)
-                    .map_err(|e| Error::Other(e.to_string()))?
-                    .ok_or_else(|| Error::Other(format!("{} isn't downloaded", inner.whisper.id)))?;
-                inner.asr = Some(Asr::load(&path, catalog::aheads_for(&inner.whisper)).map_err(|e| Error::Other(format!("{e:#}")))?);
-            }
+            let audio = localrouter_audio::decode_bytes(audio, ext.as_deref()).map_err(|e| err(format!("{e:#}")))?;
+            let asr = self.asr()?;
             let turns: Option<Vec<Turn>> = match (&opts.segments, opts.speakers) {
                 (Some(s), _) => Some(s.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone().unwrap_or_else(|| "S1".into()) }).collect()),
                 (None, true) => {
                     on_event(TranscribeEvent::Phase("speakers"));
-                    if inner.diarizer.is_none() {
-                        let dir = catalog::speaker_models_present(&inner.cache)
-                            .map_err(|e| Error::Other(e.to_string()))?
-                            .ok_or_else(|| Error::Other("speaker models aren't downloaded".into()))?;
-                        inner.diarizer = Some(Diarizer::load(&dir).map_err(|e| Error::Other(format!("{e:#}")))?);
+                    let mut slot = self.inner.diarizer.lock().unwrap();
+                    if slot.is_none() {
+                        let dir = catalog::speaker_models_present(&self.inner.cache)
+                            .map_err(err)?
+                            .ok_or_else(|| err("speaker models aren't downloaded"))?;
+                        *slot = Some(Diarizer::load(&dir).map_err(|e| err(format!("{e:#}")))?);
                     }
-                    let raw = inner.diarizer.as_mut().unwrap().run(&audio.samples).map_err(|e| Error::Other(format!("{e:#}")))?;
+                    let raw = slot.as_mut().unwrap().run(&audio.samples).map_err(|e| err(format!("{e:#}")))?;
                     Some(localrouter_speech::merge_same_speaker(&localrouter_speech::label_speakers(raw)))
                 }
                 (None, false) => None,
@@ -647,20 +839,20 @@ pub mod embedded {
             let events = std::cell::RefCell::new(on_event);
             let t = localrouter_speech::transcribe_turns_streaming(
                 &audio,
-                inner.asr.as_ref().unwrap(),
+                &asr,
                 turns,
                 &asr_opts,
                 Strategy::Windows,
                 &mut |done, total| (events.borrow_mut())(TranscribeEvent::Fraction(if total == 0 { 1.0 } else { done as f64 / total as f64 })),
                 &mut |turn| (events.borrow_mut())(TranscribeEvent::Segment(segment(turn))),
             )
-            .map_err(|e| Error::Other(format!("{e:#}")))?;
+            .map_err(|e| err(format!("{e:#}")))?;
             Ok(Transcript {
                 language: t.language.clone().unwrap_or_default(),
                 duration: t.duration_s,
                 text: t.turns.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join(" "),
                 segments: t.turns.iter().map(segment).collect(),
-                model: Some(catalog::whisper_model_id(&inner.whisper)),
+                model: Some(catalog::whisper_model_id(&self.inner.whisper)),
             })
         }
     }
@@ -695,6 +887,17 @@ mod tests {
         };
         ep.write_atomic(&dir.path().join("endpoint.json")).unwrap();
         assert!(!matches!(discover_in(dir.path()).await, Presence::Running(_)));
+    }
+
+    #[test]
+    fn windows_are_sent_as_16_bit_wav() {
+        let wav = wav_pcm16(&[0.0, 1.0, -1.0, 2.0], 16_000);
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
+        let pcm: Vec<i16> = wav[44..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(pcm, vec![0, 32767, -32767, 32767]);
     }
 
     #[cfg(target_os = "macos")]
