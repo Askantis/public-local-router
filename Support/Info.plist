@@ -38,6 +38,12 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Local Router reads the models you keep on this drive.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Local Router reads the models you keep on this network drive.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>When you turn on sharing, other computers on your network can use your models through Local Router.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>© 2026 Mikel Prandini (MikiTheAlien). Published by Askantis.</string>
 </dict>

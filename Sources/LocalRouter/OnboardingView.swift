@@ -2,16 +2,20 @@ import ServiceManagement
 import SwiftUI
 import UserNotifications
 
-/// First-launch setup: checks Ollama, asks for the two permissions the app
-/// uses (notifications, open at login), then points to the menu bar.
+/// First-launch setup: checks Ollama, turns on the background service apps
+/// use (required), offers the two optional permissions (notifications, open
+/// at login), then points to the menu bar. The service is registered only
+/// when its step is reached, so the "background item added" notice from
+/// macOS comes with an explanation.
 struct OnboardingView: View {
     @Environment(ModelStore.self) private var store
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
     @AppStorage(SettingsKey.onboardingDone) private var onboardingDone = false
     @State private var step = Step.welcome
+    @State private var daemon = DaemonStore.shared
 
-    enum Step: Int, CaseIterable { case welcome, about, ollama, storage, permissions, done }
+    enum Step: Int, CaseIterable { case welcome, about, ollama, storage, service, permissions, done }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,6 +25,7 @@ struct OnboardingView: View {
                 case .about: AboutStep()
                 case .ollama: OllamaStep()
                 case .storage: StorageStep()
+                case .service: ServiceStep()
                 case .permissions: PermissionsStep()
                 case .done: DoneStep()
                 }
@@ -48,6 +53,8 @@ struct OnboardingView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .controlSize(.large)
+                // The service is what apps use: no way around it.
+                .disabled(step == .service && !daemon.running)
             }
             .padding(24)
         }
@@ -61,7 +68,7 @@ struct OnboardingView: View {
         switch step {
         case .welcome: "Get Started"
         case .ollama: store.status == .offline ? "Skip for Now" : "Continue"
-        case .about, .storage, .permissions: "Continue"
+        case .about, .storage, .service, .permissions: "Continue"
         case .done: "Done"
         }
     }
@@ -276,47 +283,50 @@ private struct StorageStep: View {
     }
 }
 
+private struct ServiceStep: View {
+    @State private var daemon = DaemonStore.shared
+
+    var body: some View {
+        StepLayout(systemImage: "server.rack", color: .indigo, title: "Background Service",
+                   subtitle: "Apps like Scribely use your models through Local Router's background service. It runs only on this Mac.") {
+            VStack(alignment: .leading, spacing: 12) {
+                ServiceRow()
+                DriveAccessNote()
+                    .padding(.horizontal, 12)
+            }
+            .frame(maxWidth: 440)
+        }
+        .task {
+            // Reaching this step turns it on; macOS then shows its notice.
+            daemon.ensureRegistered()
+            while !Task.isCancelled {
+                await daemon.refresh()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+}
+
 private struct PermissionsStep: View {
     @Environment(ModelStore.self) private var store
-    @State private var notifications: UNAuthorizationStatus = .notDetermined
     @State private var loginStatus = SMAppService.mainApp.status
 
     var body: some View {
         StepLayout(systemImage: "hand.raised.fill", color: .orange, title: "Permissions",
                    subtitle: "Two optional permissions. Local Router only talks to Ollama on this Mac, and never reads your files.") {
             VStack(spacing: 12) {
-                PermissionRow(systemImage: "bell.badge", title: "Notifications",
-                              text: "Tells you when a model download finishes.",
-                              state: notificationState, actionTitle: notificationAction) {
-                    requestNotifications()
-                }
+                NotificationsRow()
                 PermissionRow(systemImage: "power", title: "Open at Login",
-                              text: "Keeps Local Router in your menu bar after a restart.",
+                              text: loginStatus == .requiresApproval ? "Waiting for your approval in Login Items."
+                                                                     : "Keeps Local Router in your menu bar after a restart.",
                               state: loginState, actionTitle: loginAction) {
                     toggleLogin()
                 }
             }
             .frame(maxWidth: 420)
         }
-        .task {
-            notifications = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             loginStatus = SMAppService.mainApp.status
-        }
-    }
-
-    private var notificationState: CheckRow.State {
-        switch notifications {
-        case .authorized, .provisional: .passed
-        case .denied: .failed
-        default: .pending
-        }
-    }
-
-    private var notificationAction: String? {
-        switch notifications {
-        case .notDetermined: "Allow"
-        case .denied: "Open Settings"
-        default: nil
         }
     }
 
@@ -331,19 +341,8 @@ private struct PermissionsStep: View {
     private var loginAction: String? {
         switch loginStatus {
         case .enabled: nil
-        case .requiresApproval: "Approve in Settings"
+        case .requiresApproval: "Open Login Items"
         default: "Turn On"
-        }
-    }
-
-    private func requestNotifications() {
-        if notifications == .denied {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
-            return
-        }
-        Task {
-            _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
-            notifications = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
         }
     }
 
@@ -373,78 +372,6 @@ private struct DoneStep: View {
                 Label("Browse Models for My Mac", systemImage: "arrow.down.circle")
             }
             .controlSize(.large)
-        }
-    }
-}
-
-// MARK: - Rows
-
-private struct CheckRow: View {
-    enum State { case passed, failed, pending, checking }
-
-    let title: String
-    let detail: String
-    let state: State
-
-    var body: some View {
-        HStack(spacing: 12) {
-            StateIcon(state: state)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .semibold))
-                Text(detail).font(.system(size: 12)).foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-        .padding(12)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-}
-
-private struct PermissionRow: View {
-    let systemImage: String
-    let title: String
-    let text: String
-    let state: CheckRow.State
-    let actionTitle: String?
-    let action: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: systemImage)
-                .font(.system(size: 16))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 26)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .semibold))
-                Text(text).font(.system(size: 12)).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer()
-            if let actionTitle {
-                Button(actionTitle, action: action)
-                    .buttonBorderShape(.capsule)
-            } else {
-                StateIcon(state: state)
-            }
-        }
-        .padding(12)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-}
-
-private struct StateIcon: View {
-    let state: CheckRow.State
-
-    var body: some View {
-        switch state {
-        case .passed:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.system(size: 18))
-        case .failed:
-            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).font(.system(size: 18))
-        case .pending:
-            Image(systemName: "circle").foregroundStyle(.tertiary).font(.system(size: 18))
-        case .checking:
-            ProgressView().controlSize(.small).frame(width: 18)
         }
     }
 }

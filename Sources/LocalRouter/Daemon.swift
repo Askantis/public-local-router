@@ -256,11 +256,17 @@ final class DaemonStore {
             .appendingPathComponent("Contents/Library/LaunchAgents/\(Self.plistName)").path)
     }
 
-    /// Register and start the service, then follow its events.
+    /// Follow the service's events, and register it, unless this is a first
+    /// launch: then the welcome guide turns it on at its step, with an
+    /// explanation for macOS's "background item added" notice.
     func start() {
         guard !started else { return }
         started = true
-        ensureRegistered()
+        if UserDefaults.standard.bool(forKey: SettingsKey.onboardingDone) || service.status != .notRegistered {
+            ensureRegistered()
+        } else {
+            serviceStatus = service.status
+        }
         Task { await refreshLoop() }
         Thread.detachNewThread { [weak self] in self?.followEvents() }
     }
@@ -427,7 +433,7 @@ final class DaemonStore {
     }
 
     /// Where the service keeps speech models, and whether it can read them
-    /// (PROTOCOL.md 2: ok, missing_volume, unwritable, checking).
+    /// (PROTOCOL.md 2: ok, missing_volume, not_allowed, unwritable, checking).
     private(set) var hfCachePath: String?
     private(set) var hfCacheState: String?
     private var checkingSince: Date?
@@ -450,6 +456,13 @@ final class DaemonStore {
         let state = hf?["state"] as? String
         if state == "checking" { checkingSince = checkingSince ?? Date() } else { checkingSince = nil }
         hfCacheState = state
+    }
+
+    /// "Check Again" after allowing the drive: the service looks right away.
+    func checkDriveAgain() async {
+        _ = try? await background { try UnixHTTP.request("POST", "/lr/v1/admin/hf_cache/check") }
+        try? await Task.sleep(for: .milliseconds(500))
+        await refresh()
     }
 
     func openFilesAndFoldersSettings() {
@@ -682,13 +695,7 @@ struct AppsPane: View {
                             .foregroundStyle(daemon.hfCacheState == "ok" ? Color.secondary : Color.orange)
                     }
                     .help(path)
-                    if daemon.waitingForDrivePermission {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Your models are on “\(Self.volumeName(path))”. macOS asks before a background service reads a drive like this: click Allow if it asked. If you said no before, allow Local Router under Files & Folders.")
-                                .font(.callout)
-                            Button("Open Files & Folders…") { daemon.openFilesAndFoldersSettings() }
-                        }
-                    }
+                    DriveAccessNote()
                 }
                 if let error = daemon.lastError {
                     Text(error).font(.callout).foregroundStyle(.orange)
@@ -746,16 +753,10 @@ struct AppsPane: View {
         case "ok": "Ready"
         case "checking": "Checking…"
         case "missing_volume": "Drive not connected"
+        case "not_allowed": "Not allowed"
         case "unwritable": "Can't write to the folder"
         default: "Unknown"
         }
-    }
-
-    /// "/Volumes/Models/…" → "Models"; anything else → the folder's name.
-    private static func volumeName(_ path: String) -> String {
-        let parts = URL(fileURLWithPath: path).pathComponents
-        if parts.count > 2, parts[1] == "Volumes" { return parts[2] }
-        return URL(fileURLWithPath: path).lastPathComponent
     }
 }
 
