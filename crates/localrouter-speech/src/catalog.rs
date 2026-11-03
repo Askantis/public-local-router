@@ -58,6 +58,11 @@ pub const GRUEZI_F16: WhisperModel = WhisperModel {
 
 pub const WHISPER_MODELS: &[WhisperModel] = &[WHISPER_TURBO_Q8, WHISPER_TURBO_F16, GRUEZI_Q8, GRUEZI_F16];
 
+/// The Whisper models offered to people (CLI, apps' model choices).
+/// Grüezi is on hold (backlog): known, so a copy someone has still works,
+/// but not offered.
+pub const LISTED_WHISPER_MODELS: &[WhisperModel] = &[WHISPER_TURBO_Q8, WHISPER_TURBO_F16];
+
 /// DTW alignment heads for a catalog model.
 pub fn aheads_for(model: &WhisperModel) -> crate::Aheads {
     if model.repo == "askantis/gruezi-v1" {

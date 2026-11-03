@@ -132,7 +132,13 @@ struct SettingsView: View {
         .background(BringToFront())
         .onOpenURL { url in
             if url.host == "advanced" { pane = .advanced }
-            if url.host == "apps" { pane = .apps }
+            if url.host == "apps" {
+                pane = .apps
+                let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                if let app = items.first(where: { $0.name == "app" })?.value {
+                    DaemonStore.shared.focus(app: app, role: items.first(where: { $0.name == "role" })?.value)
+                }
+            }
         }
     }
 }
