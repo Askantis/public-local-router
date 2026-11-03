@@ -40,6 +40,10 @@ pub struct TranscriptTurn {
     pub speaker: String,
     pub text: String,
     pub words: Vec<Word>,
+    /// Whisper's no-speech probability for this segment, when the turn is one
+    /// Whisper segment (no speakers); `None` for turns built from words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +141,7 @@ pub fn transcribe_turns_streaming(
     };
     let total = turns.len();
     let mut out = Vec::with_capacity(total);
+    let mut language = opts.language.clone();
     for (i, turn) in turns.iter().enumerate() {
         progress(i, total);
         if turn.end - turn.start < MIN_TURN_S {
@@ -147,7 +152,11 @@ pub fn transcribe_turns_streaming(
         if std::env::var_os("LR_DEBUG_TOKENS").is_some() {
             eprintln!("TURN\t{i}\t{start:.3}\t{end:.3}\t{}", turn.speaker);
         }
-        let segments = asr.transcribe(audio.slice(start, end), start, opts)?;
+        let full = asr.transcribe_full(audio.slice(start, end), start, opts)?;
+        if language.is_none() {
+            language = full.language;
+        }
+        let segments = full.segments;
         if !diarized {
             // No speakers: keep Whisper's own segments (sentence-like), and
             // drop the overlap of consecutive windows.
@@ -155,7 +164,7 @@ pub fn transcribe_turns_streaming(
             for s in segments.into_iter().filter(|s| !s.text.trim().is_empty() && s.end > from + 0.05) {
                 let words: Vec<Word> = s.words.into_iter().filter(|w| w.start >= from).collect();
                 let text = if words.is_empty() { s.text.trim().to_string() } else { join_text(words.iter().map(|w| w.word.as_str())) };
-                out.push(TranscriptTurn { start: s.start.max(from), end: s.end, speaker: turn.speaker.clone(), text, words });
+                out.push(TranscriptTurn { start: s.start.max(from), end: s.end, speaker: turn.speaker.clone(), text, words, no_speech_prob: Some(s.no_speech_prob) });
                 sink(out.last().unwrap());
             }
             continue;
@@ -165,7 +174,7 @@ pub fn transcribe_turns_streaming(
             continue;
         }
         let words = segments.into_iter().flat_map(|s| s.words).collect();
-        out.push(TranscriptTurn { start: turn.start, end: turn.end, speaker: turn.speaker.clone(), text, words });
+        out.push(TranscriptTurn { start: turn.start, end: turn.end, speaker: turn.speaker.clone(), text, words, no_speech_prob: None });
         sink(out.last().unwrap());
     }
     progress(total, total);
@@ -175,7 +184,7 @@ pub fn transcribe_turns_streaming(
             speakers.push(t.speaker.clone());
         }
     }
-    Ok(Transcript { duration_s: duration, language: opts.language.clone(), speakers, turns: out })
+    Ok(Transcript { duration_s: duration, language, speakers, turns: out })
 }
 
 /// [`Strategy::Windows`]: pack consecutive speaker turns into windows of at
@@ -193,11 +202,16 @@ fn transcribe_windows(
     let windows = pack_windows(&split_long(turns));
     let total = windows.len();
     let mut words: Vec<Word> = Vec::new();
+    let mut language = opts.language.clone();
     for (i, &(ws, we)) in windows.iter().enumerate() {
         progress(i, total);
         let start = (ws - TURN_PAD_S).max(0.0);
         let end = (we + TURN_PAD_S).min(duration);
-        for seg in asr.transcribe(audio.slice(start, end), start, opts)? {
+        let full = asr.transcribe_full(audio.slice(start, end), start, opts)?;
+        if language.is_none() {
+            language = full.language;
+        }
+        for seg in full.segments {
             words.extend(seg.words);
         }
     }
@@ -218,6 +232,7 @@ fn transcribe_windows(
                 speaker,
                 text: w.word.clone(),
                 words: vec![w],
+                no_speech_prob: None,
             }),
         }
     }
@@ -227,7 +242,7 @@ fn transcribe_windows(
             speakers.push(t.speaker.clone());
         }
     }
-    Ok(Transcript { duration_s: duration, language: opts.language.clone(), speakers, turns: out })
+    Ok(Transcript { duration_s: duration, language, speakers, turns: out })
 }
 
 /// Greedily join consecutive turns into windows no longer than [`MAX_TURN_S`].

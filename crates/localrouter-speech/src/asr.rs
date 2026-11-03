@@ -47,6 +47,13 @@ pub struct AsrSegment {
     pub no_speech_prob: f32,
 }
 
+/// Segments and the language Whisper detected (or was told).
+#[derive(Debug, Clone, Serialize)]
+pub struct AsrOutput {
+    pub segments: Vec<AsrSegment>,
+    pub language: Option<String>,
+}
+
 pub struct Asr {
     ctx: WhisperContext,
     // One decoding state, reused for every call: creating one allocates the
@@ -79,8 +86,13 @@ impl Asr {
     /// Transcribe 16 kHz mono `audio`. Times in the result are offset by
     /// `offset_s`, so a turn's words land on the whole file's timeline.
     pub fn transcribe(&self, audio: &[f32], offset_s: f64, opts: &AsrOptions) -> Result<Vec<AsrSegment>> {
+        Ok(self.transcribe_full(audio, offset_s, opts)?.segments)
+    }
+
+    /// [`Asr::transcribe`] plus the detected language, read under the same lock.
+    pub fn transcribe_full(&self, audio: &[f32], offset_s: f64, opts: &AsrOptions) -> Result<AsrOutput> {
         if audio.len() < 1_600 {
-            return Ok(Vec::new()); // < 0.1 s
+            return Ok(AsrOutput { segments: Vec::new(), language: None }); // < 0.1 s
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -146,7 +158,8 @@ impl Asr {
                 no_speech_prob: seg.no_speech_probability(),
             });
         }
-        Ok(segments)
+        let language = whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_owned);
+        Ok(AsrOutput { segments, language })
     }
 }
 

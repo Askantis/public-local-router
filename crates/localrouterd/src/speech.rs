@@ -191,6 +191,9 @@ pub fn segment_json(i: usize, turn: &localrouter_speech::TranscriptTurn, format:
     if req.words {
         s["words"] = json!(words_of(turn, off));
     }
+    if let Some(p) = turn.no_speech_prob {
+        s["no_speech_prob"] = json!(r3(p as f64));
+    }
     s
 }
 
@@ -279,8 +282,8 @@ mod tests {
             language: Some("de".into()),
             speakers: vec!["S1".into(), "S2".into()],
             turns: vec![
-                TranscriptTurn { start: 0.3, end: 1.0, speaker: "S1".into(), text: "Hoi Thomas".into(), words: vec![w("Hoi", 0.3, 0.6), w("Thomas", 0.6, 1.0)] },
-                TranscriptTurn { start: 1.5, end: 2.0, speaker: "S2".into(), text: "Grüezi".into(), words: vec![w("Grüezi", 1.5, 2.0)] },
+                TranscriptTurn { start: 0.3, end: 1.0, speaker: "S1".into(), text: "Hoi Thomas".into(), words: vec![w("Hoi", 0.3, 0.6), w("Thomas", 0.6, 1.0)], no_speech_prob: Some(0.012) },
+                TranscriptTurn { start: 1.5, end: 2.0, speaker: "S2".into(), text: "Grüezi".into(), words: vec![w("Grüezi", 1.5, 2.0)], no_speech_prob: None },
             ],
         }
     }

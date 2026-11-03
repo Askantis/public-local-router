@@ -47,6 +47,8 @@ async fn an_app_connects_and_uses_its_roles() {
     // No speech models in this test's cache: a clear error code, not a crash.
     let err = client.transcribe(b"RIFF".to_vec(), "x.wav", &TranscribeOptions::default()).await.unwrap_err();
     assert_eq!(err.code(), Some("role_unbound"), "{err}");
+    let err = client.transcribe_window(&[0.0; 16_000], &TranscribeOptions { offset: 12.0, ..Default::default() }).await.unwrap_err();
+    assert_eq!(err.code(), Some("role_unbound"), "{err}");
 
     // Downloads and holds.
     let d = client.download(&json!({ "model": { "store": "ollama", "id": "new:3b" }, "source": "ollama" })).await.unwrap();
@@ -132,4 +134,71 @@ async fn segments_stream_in_as_they_finish() {
     assert_eq!(streamed[0].text, t.segments[0].text);
     assert!(t.text.contains("Guten Morgen"), "{}", t.text);
     assert!(t.segments.iter().flat_map(|s| &s.words).count() >= 30);
+}
+
+/// Live windows with the real models: built in, a window runs while a file
+/// is being transcribed (it doesn't wait for the whole file), and through
+/// the service a window comes back with offset times, words and
+/// `no_speech_prob`. Needs `lr fetch` and `bench/synth.py bench/out`.
+/// Run: `cargo test -p localrouterd --features test-admin --release -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn live_windows_slot_in_and_carry_offsets() {
+    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/out/words.wav");
+    let audio = std::fs::read(&wav).expect("run bench/synth.py bench/out first");
+    let samples: std::sync::Arc<[f32]> = localrouter_audio::decode_bytes(audio.clone(), Some("wav")).unwrap().samples.into();
+    let window: std::sync::Arc<[f32]> = samples[..samples.len().min(16_000 * 8)].into();
+    let opts = TranscribeOptions { language: Some("de".into()), offset: 100.0, ..Default::default() };
+
+    let engine = localrouter_client::embedded::Engine::new(localrouter_speech::catalog::WHISPER_TURBO_Q8).unwrap();
+    let ai = LocalAi::Embedded(engine.clone());
+    assert!(matches!(ai.prepare_live().await.unwrap(), localrouter_client::LiveReady::Loaded));
+    assert!(engine.is_loaded());
+    // A long file job (the same audio four times) and a live window at once.
+    let long: Vec<u8> = localrouter_audio::wav_i16(&samples.iter().copied().cycle().take(samples.len() * 4).collect::<Vec<_>>(), 16_000);
+    let file_job = {
+        let ai = ai.clone();
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            ai.transcribe(long, "long.wav", &TranscribeOptions { language: Some("de".into()), ..Default::default() }).await.unwrap();
+            t0.elapsed()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let t0 = std::time::Instant::now();
+    let live = ai.transcribe_window(window.clone(), &opts).await.unwrap();
+    let live_took = t0.elapsed();
+    let file_took = file_job.await.unwrap();
+    assert!(live_took < file_took, "the window waited for the file: {live_took:?} vs {file_took:?}");
+    assert!(live.segments.iter().any(|s| s.text.contains("Guten Morgen")), "{live:?}");
+    assert!(live.segments.iter().all(|s| s.start >= 100.0 && s.no_speech_prob.is_some()));
+    assert!(live.segments.iter().flat_map(|s| &s.words).all(|w| w.start >= 100.0));
+    engine.unload();
+    assert!(!engine.is_loaded());
+
+    // Through the service.
+    let d = start_real_cache().await;
+    let Presence::Running(client) = discover_in(d.dir.path()).await else { panic!("Local Router should be running") };
+    let manifest: localrouter_client::ConnectRequest = serde_json::from_value(scribely_manifest()).unwrap();
+    let approve = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rid = d.sock("POST", "/lr/v1/connect", Some(scribely_manifest())).await.json()["request_id"].as_str().unwrap().to_string();
+        d.sock("POST", &format!("/lr/v1/admin/connect/{rid}"), Some(json!({ "approve": true }))).await;
+    };
+    let (app, ()) = tokio::join!(client.connect(&manifest, None), approve);
+    app.unwrap();
+    let t0 = std::time::Instant::now();
+    while d.sock("GET", "/lr/v1/health", None).await.json()["hf_cache"]["state"] != "ok" {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "cache never ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let opts = TranscribeOptions {
+        model: Some(localrouter_speech::catalog::whisper_model_id(&localrouter_speech::catalog::WHISPER_TURBO_Q8)),
+        ..opts
+    };
+    let r = client.transcribe_window(&window, &opts).await.unwrap();
+    assert_eq!(r.language.as_deref(), Some("de"));
+    assert!(r.segments.iter().any(|s| s.text.contains("Guten Morgen")), "{r:?}");
+    assert!(r.segments.iter().all(|s| s.start >= 100.0 && s.no_speech_prob.is_some()));
+    assert!(r.segments.iter().flat_map(|s| &s.words).count() >= 3);
 }
