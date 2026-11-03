@@ -49,6 +49,8 @@ pub struct AppState {
     pub ollama: Ollama,
     pub speech: Arc<Speech>,
     pub hf: RwLock<HfCacheInfo>,
+    /// Wakes the Hugging Face cache check (`POST /lr/v1/admin/hf_cache/check`).
+    pub hf_check: tokio::sync::Notify,
     pub ollama_state: RwLock<OllamaInfo>,
     /// Models apps run themselves: approval key → (models, lease end).
     pub resident: Mutex<HashMap<String, Resident>>,
@@ -209,6 +211,7 @@ pub fn router(st: Shared, transport: Transport) -> Router {
         .route("/lr/v1/admin/keys", get(admin_keys).post(admin_create_key))
         .route("/lr/v1/admin/keys/{id}", delete(admin_revoke_key))
         .route("/lr/v1/admin/shutdown", post(admin_shutdown))
+        .route("/lr/v1/admin/hf_cache/check", post(admin_check_hf_cache))
         .layer(DefaultBodyLimit::max(4 << 20))
         .layer(middleware::from_fn(request_id))
         .layer(Extension(transport))
@@ -1367,6 +1370,14 @@ async fn admin_revoke_key(State(st): State<Shared>, caller: Caller, Path(id): Pa
     }
     let _ = store.save();
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Check the Hugging Face cache again now (the person just allowed the
+/// drive); the `hf_cache.state` event tells the result.
+async fn admin_check_hf_cache(State(st): State<Shared>, caller: Caller) -> R<StatusCode> {
+    admin(&caller)?;
+    st.hf_check.notify_one();
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn admin_shutdown(State(st): State<Shared>, caller: Caller) -> R<StatusCode> {

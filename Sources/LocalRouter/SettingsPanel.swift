@@ -228,6 +228,7 @@ private struct GeneralPane: View {
     @AppStorage(SettingsKey.startOllamaAtStartup) private var startOllama = false
     @AppStorage(SettingsKey.loadDefaultAtStartup) private var loadDefault = false
     @State private var openAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var loginStatus = SMAppService.mainApp.status
 
     var body: some View {
         Form {
@@ -244,13 +245,29 @@ private struct GeneralPane: View {
                             store.lastError = "Open at Login: \(error.localizedDescription)"
                             openAtLogin = SMAppService.mainApp.status == .enabled
                         }
+                        loginStatus = SMAppService.mainApp.status
                     }
+                if loginStatus == .requiresApproval {
+                    HStack {
+                        Text("Waiting for your approval in Login Items.").font(.callout).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
                 Toggle("Start Ollama If It's Not Running", isOn: $startOllama)
                 Toggle("Load Default Model at Startup", isOn: $loadDefault)
                     .disabled(store.defaultModel == nil)
                     .help(store.defaultModel == nil ? "Choose a default model first" : "Also starts Ollama if needed")
             } header: {
                 Text("Startup")
+            }
+            Section {
+                ServiceRow()
+                NotificationsRow()
+            } header: {
+                Text("Permissions")
+            } footer: {
+                Footnote("Local Router only talks to Ollama on this Mac, and never reads your files.")
             }
             Section {
                 LabeledContent("Welcome Guide") {
@@ -267,7 +284,13 @@ private struct GeneralPane: View {
                 }
             }
         }
-        .onAppear { openAtLogin = SMAppService.mainApp.status == .enabled }
+        .onAppear {
+            openAtLogin = SMAppService.mainApp.status == .enabled
+            loginStatus = SMAppService.mainApp.status
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            loginStatus = SMAppService.mainApp.status
+        }
     }
 }
 

@@ -75,6 +75,7 @@ fn cache() -> Result<Cache> {
     match loc.state {
         CacheState::Ok => Ok(Cache::new(loc.hub)),
         CacheState::MissingVolume => bail!("the Hugging Face cache {} is on a drive that isn't connected", loc.hub.display()),
+        CacheState::NotAllowed => bail!("macOS doesn't allow access to the Hugging Face cache {} (Privacy & Security → Files & Folders)", loc.hub.display()),
         CacheState::Unwritable => bail!("the Hugging Face cache {} can't be written", loc.hub.display()),
     }
 }
