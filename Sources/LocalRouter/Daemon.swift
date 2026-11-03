@@ -181,6 +181,12 @@ struct ConnectedApp: Identifiable, Hashable, Sendable {
         let role: String
         let label: String?
         let model: String?
+        /// `chat`, `embedding`, `transcription` or `diarization`.
+        let capability: String
+        /// `app` (chosen for this app), `global`, `suggestion` or `none`.
+        let source: String
+
+        var title: String { label ?? role.capitalized }
     }
 
     let appID: String
@@ -200,9 +206,29 @@ struct ConnectedApp: Identifiable, Hashable, Sendable {
         lastUsed = json["last_used"] as? String
         roles = (json["roles"] as? [[String: Any]] ?? []).compactMap { r in
             guard let role = r["role"] as? String else { return nil }
-            return Role(role: role, label: r["label"] as? String, model: r["model"] as? String)
+            return Role(role: role, label: r["label"] as? String, model: r["model"] as? String,
+                        capability: r["capability"] as? String ?? "", source: r["source"] as? String ?? "none")
         }
     }
+}
+
+/// A model in the service's inventory (PROTOCOL.md 7.1), for choosing a role's model.
+struct InventoryModel: Identifiable, Hashable, Sendable {
+    let id: String
+    let displayName: String
+    let capabilities: [String]
+    let contextLength: Int?
+
+    init?(_ json: [String: Any]) {
+        guard let id = json["id"] as? String, (json["store"] as? String) != "app" else { return nil }
+        self.id = id
+        displayName = json["display_name"] as? String ?? id
+        capabilities = json["capabilities"] as? [String] ?? []
+        contextLength = json["context_length"] as? Int
+    }
+
+    /// Ollama names read better through ModelIdentity; speech models carry their own.
+    var title: String { id.hasPrefix("hf:") ? displayName : ModelIdentity.prettyName(id) }
 }
 
 @MainActor @Observable
@@ -214,6 +240,11 @@ final class DaemonStore {
     private(set) var running = false
     private(set) var serviceStatus: SMAppService.Status = .notRegistered
     private(set) var apps: [ConnectedApp] = []
+    /// Models a role can be bound to.
+    private(set) var inventory: [InventoryModel] = []
+    /// An app (and role) a deep link asked to show: `localrouter://apps?app=…&role=…`.
+    private(set) var focus: (app: String, role: String?)?
+    private(set) var focusToken = 0
     private(set) var lastError: String?
     private var started = false
 
@@ -345,6 +376,38 @@ final class DaemonStore {
         }
         lastError = nil
         apps = list.compactMap(ConnectedApp.init)
+        if !apps.isEmpty,
+           let models = try? await background({ try UnixHTTP.request("GET", "/lr/v1/models") }),
+           let list = (models.json as? [String: Any])?["models"] as? [[String: Any]] {
+            inventory = list.compactMap(InventoryModel.init)
+        }
+    }
+
+    /// Models that can do what a role needs.
+    func candidates(for role: ConnectedApp.Role) -> [InventoryModel] {
+        inventory.filter { $0.capabilities.contains(role.capability) }
+    }
+
+    /// Choose a role's model for one app; `nil` goes back to automatic.
+    func bind(_ app: ConnectedApp, role: String, model: String?) async {
+        let appPath = app.appID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? app.appID
+        let rolePath = role.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? role
+        _ = try? await background {
+            let body: [String: Any] = ["model": model.map { $0 as Any } ?? NSNull()]
+            return try UnixHTTP.request("PUT", "/lr/v1/admin/apps/\(appPath)/roles/\(rolePath)", json: body)
+        }
+        await refresh()
+    }
+
+    /// Show an app's row (from a deep link), for a few seconds.
+    func focus(app: String, role: String?) {
+        focus = (app, role)
+        focusToken += 1
+        let token = focusToken
+        Task {
+            try? await Task.sleep(for: .seconds(6))
+            if focusToken == token { focus = nil }
+        }
     }
 
     func disconnect(_ app: ConnectedApp) async {
@@ -601,6 +664,7 @@ struct AppsPane: View {
     @State private var newSecret: String?
 
     var body: some View {
+        ScrollViewReader { proxy in
         Form {
             Section {
                 LabeledContent("Background service") {
@@ -645,7 +709,10 @@ struct AppsPane: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(daemon.apps) { app in
-                    AppRow(app: app) { Task { await daemon.disconnect(app) } }
+                    AppRow(app: app, focusedRole: daemon.focus?.app == app.appID ? .some(daemon.focus?.role) : nil) {
+                        Task { await daemon.disconnect(app) }
+                    }
+                    .id(app.appID)
                 }
             }
 
@@ -666,6 +733,10 @@ struct AppsPane: View {
             } footer: {
                 Footnote("For tools that can only use an OpenAI-compatible address. Apps that connect themselves don't need a key.")
             }
+        }
+        .onChange(of: daemon.focusToken) {
+            if let app = daemon.focus?.app { withAnimation { proxy.scrollTo(app, anchor: .center) } }
+        }
         }
         .task { await daemon.refresh() }
     }
@@ -690,10 +761,13 @@ struct AppsPane: View {
 
 private struct AppRow: View {
     let app: ConnectedApp
+    /// Set when a deep link asked for this app: the role it named, if any.
+    let focusedRole: String??
     let disconnect: () -> Void
+    @State private var daemon = DaemonStore.shared
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(app.name).font(.system(size: 13, weight: .semibold))
                 if app.verified {
@@ -706,13 +780,63 @@ private struct AppRow: View {
                 Button("Disconnect", role: .destructive, action: disconnect).buttonStyle(.borderless)
             }
             Text(app.appID).font(.system(size: 11)).foregroundStyle(.secondary)
-            ForEach(app.roles.filter { $0.model != nil }, id: \.self) { role in
-                Text("\(role.label ?? role.role.capitalized): \(ModelIdentity.prettyName(role.model ?? ""))")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+            // Roles the app declared (they carry a label), and any with a model;
+            // not every well-known role an app could use.
+            ForEach(app.roles.filter { $0.label != nil || $0.model != nil || focusedRole == .some($0.role) }, id: \.self) { role in
+                RoleRow(app: app, role: role, highlighted: focusedRole == .some(role.role))
             }
         }
         .padding(.vertical, 2)
+        .padding(.horizontal, focusedRole != nil ? 6 : 0)
+        .background(focusedRole != nil ? Color.accentColor.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
+        .animation(.easeOut(duration: 0.3), value: focusedRole != nil)
     }
 }
 
+/// One job an app needs a model for, and the model it gets.
+private struct RoleRow: View {
+    let app: ConnectedApp
+    let role: ConnectedApp.Role
+    let highlighted: Bool
+    @State private var daemon = DaemonStore.shared
+
+    var body: some View {
+        HStack {
+            Text(role.title)
+                .font(.system(size: 12, weight: highlighted ? .semibold : .regular))
+            Spacer()
+            let candidates = daemon.candidates(for: role)
+            if candidates.isEmpty && role.model == nil {
+                Text("No model for this yet").font(.system(size: 12)).foregroundStyle(.secondary)
+            } else {
+                Menu {
+                    Button("Automatic") { Task { await daemon.bind(app, role: role.role, model: nil) } }
+                    if !candidates.isEmpty { Divider() }
+                    ForEach(candidates) { m in
+                        Button {
+                            Task { await daemon.bind(app, role: role.role, model: m.id) }
+                        } label: {
+                            if role.source == "app" && role.model == m.id {
+                                Label(m.title, systemImage: "checkmark")
+                            } else {
+                                Text(m.title)
+                            }
+                        }
+                    }
+                } label: {
+                    Text(current).font(.system(size: 12))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Which model \(app.name) uses for \(role.title.lowercased()).")
+            }
+        }
+    }
+
+    /// "Qwen 3.5 9B", or "Automatic: Qwen 3.5 9B" when Local Router chose it.
+    private var current: String {
+        guard let model = role.model else { return "Automatic" }
+        let title = daemon.inventory.first { $0.id == model }?.title ?? ModelIdentity.prettyName(model)
+        return role.source == "app" ? title : "Automatic: \(title)"
+    }
+}

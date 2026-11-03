@@ -83,7 +83,7 @@ fn models() -> Result<()> {
     let loc = CacheLocation::resolve();
     println!("Hugging Face cache: {} ({:?})", loc.hub.display(), loc.state);
     let cache = Cache::new(&loc.hub);
-    for m in catalog::WHISPER_MODELS {
+    for m in catalog::LISTED_WHISPER_MODELS {
         let state = match catalog::whisper_present(&cache, *m)? {
             Some(p) => format!("present  {}", p.display()),
             None => format!("missing  ~{} MB", m.approx_bytes / 1_000_000),
@@ -109,7 +109,11 @@ fn progress_line(label: &str, done: u64, total: Option<u64>) {
 
 fn fetch(whisper: &str) -> Result<()> {
     let cache = cache()?;
-    let model = catalog::whisper_model(whisper).with_context(|| format!("unknown Whisper model {whisper}"))?;
+    let model = catalog::LISTED_WHISPER_MODELS
+        .iter()
+        .copied()
+        .find(|m| m.id == whisper)
+        .with_context(|| format!("unknown Whisper model {whisper} (choose one of `lr models`)"))?;
     let path = catalog::ensure_whisper(&cache, model, &mut |d, t| progress_line(model.file, d, t))?;
     eprintln!("\n{}", path.display());
     let dir = catalog::ensure_speaker_models(&cache, &mut |f, d, t| progress_line(f, d, t))?;
