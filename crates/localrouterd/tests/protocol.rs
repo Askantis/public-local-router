@@ -208,3 +208,33 @@ async fn events_reach_the_right_app_and_shutdown_cleans_up() {
     }
     assert!(!d.socket().exists(), "socket removed");
 }
+
+/// A cache macOS won't let the service into is `not_allowed` (not
+/// "unwritable"), and "Check again" picks up the change without a restart.
+/// An immutable folder (`chflags uchg`) gives the same EPERM as a privacy denial.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_cache_it_may_not_open_is_not_allowed_until_checked_again() {
+    let chflags = |flag: &str, path: &std::path::Path| {
+        assert!(std::process::Command::new("/usr/bin/chflags").arg(flag).arg(path).status().unwrap().success());
+    };
+    let d = start(|dir| {
+        std::fs::create_dir_all(dir.join("hub")).unwrap();
+        chflags("uchg", &dir.join("hub"));
+    })
+    .await;
+    let hub = d.dir.path().join("hub");
+    let state = || async { d.sock("GET", "/lr/v1/health", None).await.json()["hf_cache"]["state"].as_str().unwrap_or_default().to_string() };
+    let t0 = std::time::Instant::now();
+    while state().await != "not_allowed" {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "never not_allowed: {}", state().await);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    chflags("nouchg", &hub);
+    assert_eq!(d.sock("POST", "/lr/v1/admin/hf_cache/check", None).await.status, 202);
+    let t0 = std::time::Instant::now();
+    while state().await != "ok" {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "the check didn't happen right away");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}

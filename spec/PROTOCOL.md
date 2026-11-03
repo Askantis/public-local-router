@@ -150,7 +150,7 @@ It writes to a temporary file in the same folder and renames it into place, so r
 }
 ```
 
-`protocols` lists every protocol version the service speaks (section 13). `hf_cache.state` is `ok`, `missing_volume` (the cache is on a drive that isn't connected), `unwritable`, or `checking` while the service is still finding out. Checking can take a while: macOS asks the user before a background process reads a removable drive. The `hf_cache.state` event announces the result. `ollama.state` is `running`, `stopped` or `not_installed`.
+`protocols` lists every protocol version the service speaks (section 13). `hf_cache.state` is `ok`, `missing_volume` (the cache is on a drive that isn't connected), `not_allowed` (macOS privacy keeps the service out of the drive or folder: the person said no, or hasn't answered yet), `unwritable`, or `checking` while the service is still finding out. Checking can take a while: macOS asks the user before a background process reads a removable drive. The `hf_cache.state` event announces every change. While the state isn't `ok`, the service checks again every 15 seconds; `POST /lr/v1/admin/hf_cache/check` (admin) checks right away, for example after the person allowed the drive in System Settings. `ollama.state` is `running`, `stopped` or `not_installed`.
 
 The file can be stale after a crash. A client MUST confirm with `GET /lr/v1/health` that the service answers and that `instance_id` matches before relying on it.
 

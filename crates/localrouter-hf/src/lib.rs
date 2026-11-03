@@ -36,7 +36,22 @@ pub enum CacheState {
     Ok,
     /// The cache is on a drive (`/Volumes/<name>`) that isn't connected.
     MissingVolume,
+    /// macOS privacy keeps the process out (EPERM): the person said no to
+    /// "access files on a removable volume", or wasn't asked yet.
+    NotAllowed,
     Unwritable,
+}
+
+impl CacheState {
+    /// The protocol's name for it (PROTOCOL.md 2).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CacheState::Ok => "ok",
+            CacheState::MissingVolume => "missing_volume",
+            CacheState::NotAllowed => "not_allowed",
+            CacheState::Unwritable => "unwritable",
+        }
+    }
 }
 
 impl CacheLocation {
@@ -146,11 +161,20 @@ fn cache_state(hub: &Path) -> CacheState {
     if unmounted_volume(hub).is_some() {
         return CacheState::MissingVolume;
     }
+    // EPERM is macOS privacy, not a full or read-only disk; `exists()` would
+    // hide it, so read the errors.
+    let denied = |e: &io::Error| e.raw_os_error() == Some(libc_eperm());
     // The nearest existing ancestor must be writable.
     let mut probe = hub.to_path_buf();
-    while !probe.exists() {
-        if !probe.pop() {
-            return CacheState::Unwritable;
+    loop {
+        match fs::metadata(&probe) {
+            Ok(_) => break,
+            Err(e) if denied(&e) => return CacheState::NotAllowed,
+            Err(_) => {
+                if !probe.pop() {
+                    return CacheState::Unwritable;
+                }
+            }
         }
     }
     let test = probe.join(format!(".localrouter-write-test-{}", std::process::id()));
@@ -159,8 +183,13 @@ fn cache_state(hub: &Path) -> CacheState {
             let _ = fs::remove_file(&test);
             CacheState::Ok
         }
+        Err(e) if denied(&e) => CacheState::NotAllowed,
         Err(_) => CacheState::Unwritable,
     }
+}
+
+const fn libc_eperm() -> i32 {
+    1
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -614,6 +643,23 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real EPERM: an immutable folder (`chflags uchg`) refuses new files
+    /// with EPERM, like macOS privacy does; that is "not allowed", not "unwritable".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_is_not_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let chflags = |flag: &str| assert!(std::process::Command::new("/usr/bin/chflags").arg(flag).arg(&locked).status().unwrap().success());
+        chflags("uchg");
+        let state = cache_state(&locked.join("hub"));
+        chflags("nouchg");
+        assert_eq!(state, CacheState::NotAllowed);
+        assert_eq!(cache_state(&locked.join("hub")), CacheState::Ok);
+        assert_eq!(CacheState::NotAllowed.as_str(), "not_allowed");
+    }
     use std::collections::HashMap;
 
     fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

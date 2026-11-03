@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         ollama: ollama::Ollama::new(ollama_url.clone()),
         speech: Arc::new(speech::Speech::new()),
         hf: RwLock::new(HfCacheInfo { path: Some(hub.display().to_string()), state: "checking".into() }),
+        hf_check: tokio::sync::Notify::new(),
         ollama_state: RwLock::new(OllamaInfo { url: ollama_url, state: "stopped".into(), version: None }),
         resident: Mutex::new(Default::default()),
         downloads: downloads::Downloads::new(),
@@ -93,26 +94,34 @@ async fn main() -> Result<()> {
     endpoint.write_atomic(&endpoint_path)?;
     eprintln!("localrouterd {} ready: {} and {}", env!("CARGO_PKG_VERSION"), socket_path.display(), endpoint.http);
 
-    // Check the Hugging Face cache off the main path, then announce the result.
+    // Check the Hugging Face cache off the main path and announce the result;
+    // while it isn't usable (drive not connected, not allowed yet), check
+    // again every 15 s, and whenever the app asks.
     tokio::spawn({
         let st = st.clone();
         let endpoint_path = endpoint_path.clone();
         async move {
-            let hub2 = hub.clone();
-            let state = tokio::task::spawn_blocking(move || CacheLocation::check(&hub2)).await.unwrap_or(CacheState::Unwritable);
-            let name = match state {
-                CacheState::Ok => "ok",
-                CacheState::MissingVolume => "missing_volume",
-                CacheState::Unwritable => "unwritable",
-            };
-            st.speech.set_cache((state == CacheState::Ok).then(|| Cache::new(&hub)));
-            let info = HfCacheInfo { path: Some(hub.display().to_string()), state: name.into() };
-            *st.hf.write().unwrap() = info.clone();
-            if let Ok(mut ep) = Endpoint::read(&endpoint_path) {
-                ep.hf_cache = info.clone();
-                let _ = ep.write_atomic(&endpoint_path);
+            let mut last: Option<CacheState> = None;
+            loop {
+                let hub2 = hub.clone();
+                let state = tokio::task::spawn_blocking(move || CacheLocation::check(&hub2)).await.unwrap_or(CacheState::Unwritable);
+                if last != Some(state) {
+                    last = Some(state);
+                    st.speech.set_cache((state == CacheState::Ok).then(|| Cache::new(&hub)));
+                    let info = HfCacheInfo { path: Some(hub.display().to_string()), state: state.as_str().into() };
+                    *st.hf.write().unwrap() = info.clone();
+                    if let Ok(mut ep) = Endpoint::read(&endpoint_path) {
+                        ep.hf_cache = info.clone();
+                        let _ = ep.write_atomic(&endpoint_path);
+                    }
+                    st.events.send("hf_cache.state", serde_json::to_value(&info).unwrap(), Audience::Everyone);
+                }
+                if state == CacheState::Ok {
+                    st.hf_check.notified().await;
+                } else {
+                    let _ = tokio::time::timeout(Duration::from_secs(15), st.hf_check.notified()).await;
+                }
             }
-            st.events.send("hf_cache.state", serde_json::to_value(&info).unwrap(), Audience::Everyone);
         }
     });
 
