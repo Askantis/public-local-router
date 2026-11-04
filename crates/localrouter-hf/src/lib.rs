@@ -239,10 +239,16 @@ impl Cache {
 
     /// The cache at the standard place, or an error if it can't be used.
     pub fn standard() -> Result<Self> {
-        let loc = CacheLocation::resolve();
-        match loc.state {
-            CacheState::Ok => Ok(Cache::new(loc.hub)),
-            state => Err(Error::Unavailable(loc.hub, state)),
+        Cache::at(CacheLocation::resolve_path())
+    }
+
+    /// The cache in `hub` (a folder the person chose), or an error if it
+    /// can't be used.
+    pub fn at(hub: impl Into<PathBuf>) -> Result<Self> {
+        let hub = hub.into();
+        match cache_state(&hub) {
+            CacheState::Ok => Ok(Cache::new(hub)),
+            state => Err(Error::Unavailable(hub, state)),
         }
     }
 
