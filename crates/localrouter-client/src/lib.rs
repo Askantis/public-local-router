@@ -726,10 +726,12 @@ pub mod embedded {
         /// missing models with [`catalog::ensure_whisper`] and
         /// [`catalog::ensure_speaker_models`] first.
         pub fn new(whisper: catalog::WhisperModel) -> anyhow::Result<Self> {
-            let cache = localrouter_hf::Cache::standard()?;
-            Ok(Engine {
-                inner: Arc::new(Inner { cache, whisper, asr: Mutex::new(None), diarizer: Mutex::new(None), job: Mutex::new(()) }),
-            })
+            Ok(Engine::with_cache(whisper, localrouter_hf::Cache::standard()?))
+        }
+
+        /// Like [`new`](Self::new), with the models in another cache.
+        pub fn with_cache(whisper: catalog::WhisperModel, cache: localrouter_hf::Cache) -> Self {
+            Engine { inner: Arc::new(Inner { cache, whisper, asr: Mutex::new(None), diarizer: Mutex::new(None), job: Mutex::new(()) }) }
         }
 
         pub fn transcribe(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> Result<Transcript> {
