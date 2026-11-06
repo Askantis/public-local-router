@@ -525,6 +525,7 @@ Local Router extensions; implementations MUST ignore unknown `lr_` fields:
 | `lr_denoise` | `true` to reduce background noise before transcribing |
 | `lr_vad` | `false` to skip voice-activity detection. Default `true`. |
 | `lr_priority` | `live`, `interactive` (default) or `batch`. Live requests go first, so a live recording never waits behind a two-hour file. |
+| `lr_voiceprints` | `true` to add each speaker's voiceprint to `lr_speakers_json` (below), for apps that recognise people the user asked them to remember. Only when Local Router separates the speakers itself (not with `lr_segments`). Default `false`. |
 
 The audio is processed in memory and never stored (section 14). A file path can't be sent instead of the audio, because the service must not read the user's files. If the client closes the connection, the job is cancelled.
 
@@ -558,6 +559,16 @@ The audio is processed in memory and never stored (section 14). A file path can'
 Speakers are numbered `S1`, `S2`, … in the order they first speak. Naming them is up to the app. With `lr_segments`, the speakers are the ones the app supplied.
 
 `overlaps` are the stretches of at least 0.5 s where two speakers talk at once, from the speaker separation before each moment is given to one speaker (the segments never overlap). Empty with `lr_segments`.
+
+With `lr_voiceprints=true`, each speaker that talks alone somewhere also has a `voiceprint`:
+
+```json
+"speakers": [ { "id": "S1", "voiceprint": { "model": "pyannote/wespeaker-voxceleb-resnet34", "vector": [0.031, -0.087, …], "speech_s": 48.2 } } ]
+```
+
+`vector` is the mean of the speaker's embeddings from the speaker separation (each L2-normalised, weighted by how much the speaker talks in its window), L2-normalised again: 256 numbers. Two voiceprints of the same `model` compare by their dot product (cosine similarity); voiceprints of different models don't compare. `speech_s` is how many seconds of the speaker's speech it comes from: a voiceprint from a few seconds is less reliable than one from minutes. The field was added later in version 1 and is optional: clients MUST NOT require it, and an older Local Router ignores `lr_voiceprints` and sends none.
+
+A voiceprint identifies a person: it is biometric data. Local Router computes it only when asked and keeps none (section 14). An app that stores voiceprints SHOULD do so only for people the user chose to remember, on the user's device, and SHOULD let the user delete them.
 
 **Streaming** (`stream=true`) sends these events, then closes the stream. Every `data` object carries its event name in a `type` field, as in OpenAI's API:
 
@@ -663,7 +674,7 @@ An app that runs its own pipeline (separate speakers, then transcribe each turn)
 
 These rules keep Local Router's promise that it collects nothing. An implementation of `localrouterd`:
 
-1. MUST NOT write prompts, answers, audio, transcripts or embeddings to disk, to logs, or anywhere else. They exist in memory only while a request runs.
+1. MUST NOT write prompts, answers, audio, transcripts, embeddings or voiceprints to disk, to logs, or anywhere else. They exist in memory only while a request runs.
 2. MAY record metadata about requests (time, app, endpoint, model, duration, token counts, audio length, bytes) and show it to the user. It MUST NOT send that metadata anywhere.
 3. MUST NOT open network connections on its own. The only connections it makes are:
    - to Ollama on loopback;

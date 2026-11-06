@@ -1,11 +1,14 @@
 //! Speaker diarization with speakrs: segmentation-3.0, WeSpeaker embeddings,
 //! PLDA and VBx clustering, as in pyannote's community-1 pipeline.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use speakrs::{ExecutionMode, OwnedDiarizationPipeline};
+
+use crate::voice::{self, VoiceEmbedder, Voiceprint};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Turn {
@@ -30,6 +33,9 @@ pub const MIN_OVERLAP_S: f64 = 0.5;
 pub struct Diarizer {
     pipeline: OwnedDiarizationPipeline,
     overlaps: Vec<Overlap>,
+    voiceprints: BTreeMap<String, Voiceprint>,
+    models_dir: PathBuf,
+    embedder: Option<VoiceEmbedder>,
 }
 
 /// The execution mode. Native CPU by default: on a three-speaker test it
@@ -49,7 +55,7 @@ impl Diarizer {
     pub fn load(models_dir: &Path) -> Result<Self> {
         let pipeline = OwnedDiarizationPipeline::from_dir(models_dir, default_mode())
             .with_context(|| format!("loading the speaker models from {}", models_dir.display()))?;
-        Ok(Diarizer { pipeline, overlaps: Vec::new() })
+        Ok(Diarizer { pipeline, overlaps: Vec::new(), voiceprints: BTreeMap::new(), models_dir: models_dir.to_path_buf(), embedder: None })
     }
 
     /// Who speaks when, with at most one speaker at a time (overlaps go to the
@@ -57,14 +63,20 @@ impl Diarizer {
     /// The overlaps of the speakers' own segments go to [`Diarizer::overlaps`].
     pub fn run(&mut self, audio: &[f32]) -> Result<Vec<Turn>> {
         self.overlaps.clear();
+        self.voiceprints.clear();
         let result = self.pipeline.run(audio).context("separating speakers")?;
         let turns: Vec<Turn> = result
             .exclusive_segments
-            .into_iter()
-            .map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker })
+            .iter()
+            .map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone() })
             .collect();
-        let raw: Vec<Turn> = result.segments.into_iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker }).collect();
+        let raw: Vec<Turn> = result.segments.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone() }).collect();
         self.overlaps = name_like(&turns, detect_overlaps(&raw, MIN_OVERLAP_S));
+        let labels = labels_like(&turns);
+        self.voiceprints = voice::from_diarization(&result, &turns)
+            .into_iter()
+            .filter_map(|(raw, v)| labels.get(&raw).map(|l| (l.clone(), v)))
+            .collect();
         Ok(turns)
     }
 
@@ -73,6 +85,22 @@ impl Diarizer {
     /// ("Speaker 1", …).
     pub fn overlaps(&self) -> &[Overlap] {
         &self.overlaps
+    }
+
+    /// Each speaker's voiceprint from the last [`Diarizer::run`] (the mean of
+    /// the embeddings its clustering used), named as [`Diarizer::overlaps`].
+    /// Speakers who never talk alone have none.
+    pub fn voiceprints(&self) -> &BTreeMap<String, Voiceprint> {
+        &self.voiceprints
+    }
+
+    /// Voiceprints for turns that are already known (a project transcribed
+    /// earlier, or edited since), with the voice model loaded on first use.
+    pub fn voiceprints_of(&mut self, audio: &[f32], turns: &[Turn]) -> Result<BTreeMap<String, Voiceprint>> {
+        if self.embedder.is_none() {
+            self.embedder = Some(VoiceEmbedder::load(&self.models_dir)?);
+        }
+        self.embedder.as_mut().expect("loaded above").voiceprints(audio, turns)
     }
 }
 
@@ -103,12 +131,22 @@ pub fn detect_overlaps(segments: &[Turn], min_s: f64) -> Vec<Overlap> {
     out
 }
 
-/// The speakers of `overlaps` named as `label_speakers(turns)` names them.
-fn name_like(turns: &[Turn], overlaps: Vec<Overlap>) -> Vec<Overlap> {
+/// The names `label_speakers(turns)` gives the speakers of `turns`, by raw label.
+fn labels_like(turns: &[Turn]) -> BTreeMap<String, String> {
     let labelled = crate::label_speakers(turns.to_vec());
     let mut sorted = turns.to_vec();
     sorted.sort_by(|a, b| a.start.total_cmp(&b.start));
-    let name = |raw: &str| sorted.iter().zip(&labelled).find(|(t, _)| t.speaker == raw).map(|(_, l)| l.speaker.clone()).unwrap_or_else(|| raw.to_string());
+    let mut out = BTreeMap::new();
+    for (t, l) in sorted.iter().zip(&labelled) {
+        out.entry(t.speaker.clone()).or_insert_with(|| l.speaker.clone());
+    }
+    out
+}
+
+/// The speakers of `overlaps` named as `label_speakers(turns)` names them.
+fn name_like(turns: &[Turn], overlaps: Vec<Overlap>) -> Vec<Overlap> {
+    let labels = labels_like(turns);
+    let name = |raw: &str| labels.get(raw).cloned().unwrap_or_else(|| raw.to_string());
     overlaps
         .into_iter()
         .map(|o| {
