@@ -17,6 +17,7 @@
 //! with the same engine and the same Hugging Face cache (feature `embedded`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use localrouter_core::{AppRecord, ConnectRequest, Endpoint, ModelRef, RoleDeclaration};
@@ -37,6 +38,9 @@ pub enum Error {
     Denied,
     #[error("nobody answered the connection request in time")]
     Expired,
+    /// The app stopped the work with [`Cancel::cancel`].
+    #[error("cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
@@ -52,6 +56,79 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Reaching Local Router's socket; it's local, so this only trips when it hangs.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Requests Local Router answers at once (status, roles, downloads' state).
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A whole chat answer, or loading a model to hold: a model may load first.
+pub const CHAT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// One live window (at most 30 s of audio).
+pub const WINDOW_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// Whole-file work answered in one piece (transcription without streaming,
+/// diarization).
+pub const FILE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+/// A streamed transcription has no overall limit (long files take long),
+/// but this much silence means Local Router is stuck. It's generous because
+/// Local Router sends nothing while it decodes, finds speakers or waits for
+/// another app's file.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Stops a transcription from elsewhere (a Cancel button): the call returns
+/// [`Error::Cancelled`] right away. Through Local Router the request is
+/// dropped; in the app the engine stops at its next window.
+#[derive(Clone)]
+pub struct Cancel(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for Cancel {
+    fn default() -> Self {
+        Cancel(Arc::new(tokio::sync::watch::Sender::new(false)))
+    }
+}
+
+impl std::fmt::Debug for Cancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Cancel").field(&self.is_cancelled()).finish()
+    }
+}
+
+impl Cancel {
+    pub fn new() -> Self {
+        Cancel::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once [`cancel`](Self::cancel) was called.
+    pub async fn cancelled(&self) {
+        let mut rx = self.0.subscribe();
+        let _ = rx.wait_for(|c| *c).await;
+    }
+
+    /// `work`, unless cancelled first.
+    pub async fn run<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        if self.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        tokio::select! {
+            r = work => r,
+            _ = self.cancelled() => Err(Error::Cancelled),
+        }
+    }
+}
+
+/// `work` within `limit`, or a transport error saying what took too long.
+async fn within<T>(limit: Duration, what: &str, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(limit, work)
+        .await
+        .unwrap_or_else(|_| Err(Error::Transport(format!("Local Router didn't answer {what} within {} s", limit.as_secs()))))
+}
 
 /// What [`discover`] found.
 #[allow(clippy::large_enum_variant)] // returned once, at discovery
@@ -122,11 +199,15 @@ pub async fn start() -> Result<Client> {
     #[cfg(target_os = "macos")]
     {
         // Launching the app (in the background) makes sure its service runs.
-        let ok = std::process::Command::new("/usr/bin/open")
-            .args(["-g", "-b", localrouter_core::BUNDLE_ID])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // `open` waits for Launch Services: off the async threads.
+        let ok = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("/usr/bin/open")
+                .args(["-g", "-b", localrouter_core::BUNDLE_ID])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+        .await
+        .unwrap_or(false);
         if !ok {
             return Err(Error::Other("Local Router isn't installed".into()));
         }
@@ -239,8 +320,10 @@ pub struct Transcript {
 impl Client {
     pub fn new(endpoint: &Endpoint) -> Result<Self> {
         let socket = endpoint.socket.as_ref().ok_or_else(|| Error::Other("Local Router has no socket".into()))?;
+        // No overall timeout here: each call sets its own (the constants above).
         let http = reqwest::Client::builder()
             .unix_socket(PathBuf::from(socket))
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| Error::Transport(e.to_string()))?;
         Ok(Client {
@@ -264,6 +347,20 @@ impl Client {
         format!("http://lr{path}")
     }
 
+    /// A request Local Router answers at once ([`CONTROL_TIMEOUT`]; callers
+    /// that wait longer set their own).
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.http.request(method, self.url(path)).timeout(CONTROL_TIMEOUT)
+    }
+
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::GET, path)
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, path)
+    }
+
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let resp = req.header("LR-Client", &self.user_agent).send().await.map_err(|e| Error::Transport(e.to_string()))?;
         if resp.status().is_success() {
@@ -282,14 +379,14 @@ impl Client {
     }
 
     pub async fn health(&self) -> Result<Health> {
-        self.json(self.http.get(self.url("/lr/v1/health")).timeout(Duration::from_secs(3))).await
+        self.json(self.get("/lr/v1/health").timeout(Duration::from_secs(3))).await
     }
 
     /// Connect once (PROTOCOL.md 5.2). Askantis-signed apps are approved right
     /// away; others wait until the user answers in Local Router, calling
     /// `waiting` once so the app can say "Allow it in Local Router".
     pub async fn connect(&self, manifest: &ConnectRequest, waiting: Option<&(dyn Fn() + Sync)>) -> Result<AppRecord> {
-        let resp = self.send(self.http.post(self.url("/lr/v1/connect")).json(manifest)).await?;
+        let resp = self.send(self.post("/lr/v1/connect").json(manifest)).await?;
         let pending = resp.status() == reqwest::StatusCode::ACCEPTED;
         let body: Value = resp.json().await.map_err(|e| Error::Transport(e.to_string()))?;
         if !pending {
@@ -302,7 +399,7 @@ impl Client {
         let deadline = Instant::now() + Duration::from_secs(6 * 60);
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let s: Value = self.json(self.http.get(self.url(&poll))).await?;
+            let s: Value = self.json(self.get(&poll)).await?;
             match s["status"].as_str() {
                 Some("approved") => return serde_json::from_value(s["app"].clone()).map_err(|e| Error::Other(e.to_string())),
                 Some("denied") => return Err(Error::Denied),
@@ -314,39 +411,39 @@ impl Client {
     }
 
     pub async fn me(&self) -> Result<AppRecord> {
-        self.json(self.http.get(self.url("/lr/v1/me"))).await
+        self.json(self.get("/lr/v1/me")).await
     }
 
     pub async fn put_roles(&self, roles: &[RoleDeclaration]) -> Result<AppRecord> {
-        self.json(self.http.put(self.url("/lr/v1/me/roles")).json(&json!({ "roles": roles }))).await
+        self.json(self.request(reqwest::Method::PUT, "/lr/v1/me/roles").json(&json!({ "roles": roles }))).await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
-        self.send(self.http.delete(self.url("/lr/v1/me"))).await.map(|_| ())
+        self.send(self.request(reqwest::Method::DELETE, "/lr/v1/me")).await.map(|_| ())
     }
 
     pub async fn models(&self) -> Result<Vec<Value>> {
-        let v: Value = self.json(self.http.get(self.url("/lr/v1/models"))).await?;
+        let v: Value = self.json(self.get("/lr/v1/models")).await?;
         Ok(v["models"].as_array().cloned().unwrap_or_default())
     }
 
     /// Tell Local Router about models the app runs itself (PROTOCOL.md 9).
     pub async fn report_resident(&self, models: &[Value], lease_seconds: u64) -> Result<()> {
         let body = json!({ "models": models, "lease_seconds": lease_seconds });
-        self.send(self.http.put(self.url("/lr/v1/me/resident")).json(&body)).await.map(|_| ())
+        self.send(self.request(reqwest::Method::PUT, "/lr/v1/me/resident").json(&body)).await.map(|_| ())
     }
 
     /// A chat turn through Ollama's API (non-streaming). `body` is Ollama's
     /// `/api/chat` request; its `model` may be `localrouter/<role>`.
     pub async fn chat(&self, mut body: Value) -> Result<Value> {
         body["stream"] = json!(false);
-        self.json(self.http.post(self.url("/api/chat")).json(&body)).await
+        self.json(self.post("/api/chat").timeout(CHAT_TIMEOUT).json(&body)).await
     }
 
     /// Speech to text; `audio` is the file's bytes and `filename` its name (for the format).
     pub async fn transcribe(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> Result<Transcript> {
-        let form = self.transcribe_form(audio, filename, opts);
-        let resp = self.send(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
+        let form = self.transcribe_form(bytes_part(audio, filename), opts);
+        let resp = self.send(self.post("/v1/audio/transcriptions").timeout(FILE_TIMEOUT).multipart(form)).await?;
         let model = resp.headers().get("LR-Resolved-Model").and_then(|v| v.to_str().ok()).map(str::to_owned);
         let mut t: Transcript = resp.json().await.map_err(|e| Error::Transport(e.to_string()))?;
         t.model = model;
@@ -360,16 +457,36 @@ impl Client {
         audio: Vec<u8>,
         filename: &str,
         opts: &TranscribeOptions,
-        mut on_segment: impl FnMut(TranscriptSegment),
+        on_segment: impl FnMut(TranscriptSegment),
     ) -> Result<Transcript> {
+        self.stream_transcription(bytes_part(audio, filename), opts, on_segment).await
+    }
+
+    /// [`transcribe_streaming`](Self::transcribe_streaming) of a file, sent
+    /// from disk as it's read (a long video isn't held in memory).
+    pub async fn transcribe_file_streaming(&self, path: &Path, opts: &TranscribeOptions, on_segment: impl FnMut(TranscriptSegment)) -> Result<Transcript> {
+        let part = reqwest::multipart::Part::file(path).await.map_err(|e| Error::Other(format!("reading {}: {e}", path.display())))?;
+        self.stream_transcription(part, opts, on_segment).await
+    }
+
+    /// No overall limit: a long file streams for long. Silence longer than
+    /// [`STREAM_IDLE_TIMEOUT`] (before the answer starts or between events)
+    /// means Local Router is stuck.
+    async fn stream_transcription(&self, file: reqwest::multipart::Part, opts: &TranscribeOptions, mut on_segment: impl FnMut(TranscriptSegment)) -> Result<Transcript> {
         use futures::StreamExt;
-        let form = self.transcribe_form(audio, filename, opts).text("stream", "true");
-        let resp = self.send(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
+        let form = self.transcribe_form(file, opts).text("stream", "true");
+        let req = self.http.post(self.url("/v1/audio/transcriptions")).multipart(form);
+        let resp = within(STREAM_IDLE_TIMEOUT, "the transcription", self.send(req)).await?;
         let model = resp.headers().get("LR-Resolved-Model").and_then(|v| v.to_str().ok()).map(str::to_owned);
         let mut body = resp.bytes_stream();
         let mut buf = String::new();
-        while let Some(chunk) = body.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk.map_err(|e| Error::Transport(e.to_string()))?));
+        loop {
+            let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await {
+                Ok(Some(chunk)) => chunk.map_err(|e| Error::Transport(e.to_string()))?,
+                Ok(None) => break,
+                Err(_) => return Err(Error::Transport(format!("Local Router sent nothing for {} min during the transcription", STREAM_IDLE_TIMEOUT.as_secs() / 60))),
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(end) = buf.find("\n\n") {
                 let block: String = buf.drain(..end + 2).collect();
                 let data: String = block.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim).collect();
@@ -397,9 +514,9 @@ impl Client {
         Err(Error::Transport("the transcription stream ended early".into()))
     }
 
-    fn transcribe_form(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions) -> reqwest::multipart::Form {
+    fn transcribe_form(&self, file: reqwest::multipart::Part, opts: &TranscribeOptions) -> reqwest::multipart::Form {
         let mut form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(audio).file_name(filename.to_string()))
+            .part("file", file)
             .text("model", opts.model.clone().unwrap_or_else(|| "localrouter/transcribe".into()))
             .text("response_format", if opts.speakers || opts.segments.is_some() { "lr_speakers_json" } else { "verbose_json" })
             .text("timestamp_granularities[]", "word")
@@ -426,16 +543,16 @@ impl Client {
     /// body of `POST /lr/v1/downloads`, for example
     /// `{"model": {"store": "ollama", "id": "qwen3.5:9b"}, "source": "ollama"}`.
     pub async fn download(&self, request: &Value) -> Result<Download> {
-        self.json(self.http.post(self.url("/lr/v1/downloads")).json(request)).await
+        self.json(self.post("/lr/v1/downloads").json(request)).await
     }
 
     pub async fn download_status(&self, id: &str) -> Result<Download> {
-        self.json(self.http.get(self.url(&format!("/lr/v1/downloads/{id}")))).await
+        self.json(self.get(&format!("/lr/v1/downloads/{id}"))).await
     }
 
     /// Stop waiting for a download; it stops when no other app wants it.
     pub async fn cancel_download(&self, id: &str) -> Result<Download> {
-        self.json(self.http.delete(self.url(&format!("/lr/v1/downloads/{id}")))).await
+        self.json(self.request(reqwest::Method::DELETE, &format!("/lr/v1/downloads/{id}"))).await
     }
 
     /// Follow a download to the end, calling `progress` about twice a second.
@@ -466,18 +583,17 @@ impl Client {
         if let Some(k) = keep_alive {
             body["keep_alive"] = json!(k);
         }
-        self.json(self.http.post(self.url("/lr/v1/models/load")).json(&body)).await
+        self.json(self.post("/lr/v1/models/load").timeout(CHAT_TIMEOUT).json(&body)).await
     }
 
     pub async fn release(&self, model: &str) -> Result<()> {
-        self.send(self.http.post(self.url("/lr/v1/models/unload")).json(&json!({ "model": model }))).await.map(|_| ())
+        self.send(self.post("/lr/v1/models/unload").json(&json!({ "model": model }))).await.map(|_| ())
     }
 
     /// Who speaks when (PROTOCOL.md 11.5).
     pub async fn diarize(&self, audio: Vec<u8>, filename: &str) -> Result<Vec<Segment>> {
-        let form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(audio).file_name(filename.to_string()));
-        let v: Value = self.json(self.http.post(self.url("/lr/v1/audio/diarizations")).multipart(form)).await?;
+        let form = reqwest::multipart::Form::new().part("file", bytes_part(audio, filename));
+        let v: Value = self.json(self.post("/lr/v1/audio/diarizations").timeout(FILE_TIMEOUT).multipart(form)).await?;
         serde_json::from_value(v["segments"].clone()).map_err(|e| Error::Other(e.to_string()))
     }
 }
@@ -547,7 +663,7 @@ impl Client {
         if opts.offset != 0.0 {
             form = form.text("lr_offset", opts.offset.to_string());
         }
-        let v: Value = self.json(self.http.post(self.url("/v1/audio/transcriptions")).multipart(form)).await?;
+        let v: Value = self.json(self.post("/v1/audio/transcriptions").timeout(WINDOW_TIMEOUT).multipart(form)).await?;
         let language = v["language"].as_str().filter(|l| !l.is_empty()).map(str::to_owned);
         let segments = serde_json::from_value(v["segments"].clone()).map_err(|e| Error::Other(e.to_string()))?;
         Ok(WindowResult { language, segments })
@@ -566,6 +682,10 @@ impl Client {
         });
         Ok(HoldGuard { client: self.clone(), model: model.to_string(), renew })
     }
+}
+
+fn bytes_part(audio: Vec<u8>, filename: &str) -> reqwest::multipart::Part {
+    reqwest::multipart::Part::bytes(audio).file_name(filename.to_string())
 }
 
 /// Mono samples as 16-bit PCM WAV (kept here so the client stays light;
@@ -649,6 +769,33 @@ impl LocalAi {
                 tokio::task::spawn_blocking(move || e.transcribe_with_progress(audio, &filename, &opts, &mut on_event))
                     .await
                     .map_err(|e| Error::Other(e.to_string()))?
+            }
+        }
+    }
+
+    /// Transcribe a file with progress, read from disk as it goes (a
+    /// multi-gigabyte video isn't loaded into memory first). `cancel` stops
+    /// it: through Local Router the request is dropped; in the app the
+    /// engine stops at its next window. Either way it returns
+    /// [`Error::Cancelled`] at once, and `on_event` isn't called after that.
+    pub async fn transcribe_file(
+        &self,
+        path: &Path,
+        opts: &TranscribeOptions,
+        cancel: &Cancel,
+        on_event: impl FnMut(TranscribeEvent) + Send + 'static,
+    ) -> Result<Transcript> {
+        let mut on_event = on_event;
+        match self {
+            LocalAi::Connected(c) => {
+                on_event(TranscribeEvent::Phase("transcribe"));
+                cancel.run(c.transcribe_file_streaming(path, opts, move |s| on_event(TranscribeEvent::Segment(s)))).await
+            }
+            #[cfg(feature = "embedded")]
+            LocalAi::Embedded(e) => {
+                let (e, path, opts, stop) = (e.clone(), path.to_path_buf(), opts.clone(), cancel.clone());
+                let job = tokio::task::spawn_blocking(move || e.transcribe_file_with_progress(&path, &opts, &stop, &mut on_event));
+                cancel.run(async { job.await.map_err(|e| Error::Other(e.to_string()))? }).await
             }
         }
     }
@@ -806,6 +953,28 @@ pub mod embedded {
             on_event(TranscribeEvent::Phase("decode"));
             let ext = filename.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
             let audio = localrouter_audio::decode_bytes(audio, ext.as_deref()).map_err(|e| err(format!("{e:#}")))?;
+            self.run(&audio, opts, &Cancel::default(), on_event)
+        }
+
+        /// [`transcribe_with_progress`](Self::transcribe_with_progress) of a
+        /// file, decoded as it's read, stopping soon after `cancel`.
+        pub fn transcribe_file_with_progress(&self, path: &Path, opts: &TranscribeOptions, cancel: &Cancel, on_event: &mut (dyn FnMut(TranscribeEvent) + Send)) -> Result<Transcript> {
+            let _job = (opts.priority.as_deref() != Some("live")).then(|| self.inner.job.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut on_event = |e: TranscribeEvent| {
+                if !cancel.is_cancelled() {
+                    on_event(e)
+                }
+            };
+            stop_if(cancel)?;
+            on_event(TranscribeEvent::Phase("decode"));
+            let audio = localrouter_audio::decode_file(path).map_err(|e| err(format!("{e:#}")))?;
+            self.run(&audio, opts, cancel, &mut on_event)
+        }
+
+        /// Speakers (unless given), then the words. Between phases and windows
+        /// `cancel` is looked at.
+        fn run(&self, audio: &localrouter_audio::Audio, opts: &TranscribeOptions, cancel: &Cancel, on_event: &mut (dyn FnMut(TranscribeEvent) + Send)) -> Result<Transcript> {
+            stop_if(cancel)?;
             let asr = self.asr()?;
             let turns: Option<Vec<Turn>> = match (&opts.segments, opts.speakers) {
                 (Some(s), _) => Some(s.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone().unwrap_or_else(|| "S1".into()) }).collect()),
@@ -818,11 +987,13 @@ pub mod embedded {
                             .ok_or_else(|| err("speaker models aren't downloaded"))?;
                         *slot = Some(Diarizer::load(&dir).map_err(|e| err(format!("{e:#}")))?);
                     }
+                    stop_if(cancel)?;
                     let raw = slot.as_mut().unwrap().run(&audio.samples).map_err(|e| err(format!("{e:#}")))?;
                     Some(localrouter_speech::merge_same_speaker(&localrouter_speech::label_speakers(raw)))
                 }
                 (None, false) => None,
             };
+            stop_if(cancel)?;
             on_event(TranscribeEvent::Phase("transcribe"));
             let asr_opts = AsrOptions { language: opts.language.clone(), prompt: opts.prompt.clone(), threads: 0 };
             let with_speakers = opts.speakers || opts.segments.is_some();
@@ -839,15 +1010,20 @@ pub mod embedded {
                     .collect(),
             };
             let events = std::cell::RefCell::new(on_event);
-            let t = localrouter_speech::transcribe_turns_streaming(
-                &audio,
-                &asr,
-                turns,
-                &asr_opts,
-                Strategy::Windows,
-                &mut |done, total| (events.borrow_mut())(TranscribeEvent::Fraction(if total == 0 { 1.0 } else { done as f64 / total as f64 })),
-                &mut |turn| (events.borrow_mut())(TranscribeEvent::Segment(segment(turn))),
-            )
+            let t = until_cancelled(cancel, || {
+                localrouter_speech::transcribe_turns_streaming(
+                    audio,
+                    &asr,
+                    turns,
+                    &asr_opts,
+                    Strategy::Windows,
+                    &mut |done, total| {
+                        unwind_if(cancel);
+                        (events.borrow_mut())(TranscribeEvent::Fraction(if total == 0 { 1.0 } else { done as f64 / total as f64 }))
+                    },
+                    &mut |turn| (events.borrow_mut())(TranscribeEvent::Segment(segment(turn))),
+                )
+            })?
             .map_err(|e| err(format!("{e:#}")))?;
             Ok(Transcript {
                 language: t.language.clone().unwrap_or_default(),
@@ -857,6 +1033,36 @@ pub mod embedded {
                 model: Some(catalog::whisper_model_id(&self.inner.whisper)),
             })
         }
+    }
+
+    fn stop_if(cancel: &Cancel) -> Result<()> {
+        if cancel.is_cancelled() { Err(Error::Cancelled) } else { Ok(()) }
+    }
+
+    /// The speech engine's windows can't be told to stop, but it reports
+    /// progress before each one: there, a cancelled job unwinds (without the
+    /// panic hook, so nothing is printed) back to [`until_cancelled`]. The
+    /// progress callback runs in Rust between windows, outside any lock the
+    /// next job needs (the job lock is taken poison-tolerant). With
+    /// `panic = "abort"` it doesn't unwind and the job runs to its end.
+    struct Stopped;
+
+    pub(crate) fn unwind_if(cancel: &Cancel) {
+        #[cfg(panic = "unwind")]
+        if cancel.is_cancelled() {
+            std::panic::resume_unwind(Box::new(Stopped));
+        }
+        #[cfg(not(panic = "unwind"))]
+        let _ = cancel;
+    }
+
+    pub(crate) fn until_cancelled<T>(cancel: &Cancel, work: impl FnOnce() -> T) -> Result<T> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(v) => Ok(v),
+            Err(p) if p.is::<Stopped>() => Err(Error::Cancelled),
+            Err(p) => std::panic::resume_unwind(p),
+        }
+        .and_then(|v| stop_if(cancel).map(|_| v))
     }
 
     /// "Speaker 3" → "S3", as Local Router labels them.
@@ -889,6 +1095,58 @@ mod tests {
         };
         ep.write_atomic(&dir.path().join("endpoint.json")).unwrap();
         assert!(!matches!(discover_in(dir.path()).await, Presence::Running(_)));
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_waiting_at_once() {
+        let cancel = Cancel::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stop.cancel();
+        });
+        let hung = cancel.run(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), hung).await, Ok(Err(Error::Cancelled))));
+        assert!(cancel.is_cancelled());
+        // Cancelled before it starts: the work isn't begun.
+        assert!(matches!(cancel.run(async { Ok(1) }).await, Err(Error::Cancelled)));
+        assert_eq!(Cancel::new().run(async { Ok(1) }).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hung_call_times_out() {
+        let r = within(Duration::from_millis(20), "the test", async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(r, Err(Error::Transport(m)) if m.contains("the test")));
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn a_cancelled_engine_job_unwinds_quietly() {
+        use embedded::{unwind_if, until_cancelled};
+        let cancel = Cancel::new();
+        let mut windows = 0;
+        let r = until_cancelled(&cancel, || {
+            for i in 0..10 {
+                unwind_if(&cancel);
+                windows += 1;
+                if i == 2 {
+                    cancel.cancel();
+                }
+            }
+        });
+        assert!(matches!(r, Err(Error::Cancelled)));
+        assert_eq!(windows, 3, "stops at the next window");
+        assert!(until_cancelled(&Cancel::new(), || 7).is_ok_and(|v| v == 7));
+        // Other panics aren't swallowed.
+        let other = std::panic::catch_unwind(|| until_cancelled(&Cancel::new(), || panic!("boom")));
+        assert!(other.is_err());
     }
 
     #[test]
