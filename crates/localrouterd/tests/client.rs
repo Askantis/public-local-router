@@ -202,3 +202,75 @@ async fn live_windows_slot_in_and_carry_offsets() {
     assert!(r.segments.iter().all(|s| s.start >= 100.0 && s.no_speech_prob.is_some()));
     assert!(r.segments.iter().flat_map(|s| &s.words).count() >= 3);
 }
+
+/// With speakers, lines come as they're written, before the speakers are
+/// known, then their speakers; the final segments come once known. Built in
+/// and through the service. Needs `lr fetch` and `bench/synth.py bench/out`.
+/// Run: `cargo test -p localrouterd --features test-admin --release -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn lines_stream_before_speakers_are_known() {
+    use localrouter_client::TranscribeEvent as E;
+    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/out/conv.wav");
+    let opts = TranscribeOptions { language: Some("de".into()), speakers: true, ..Default::default() };
+    let check = |events: &[(E, f64)], t: &localrouter_client::Transcript, how: &str| {
+        let at = |pred: &dyn Fn(&E) -> bool| events.iter().find(|(e, _)| pred(e)).map(|(_, s)| *s);
+        let first_line = at(&|e| matches!(e, E::Line(_))).expect("lines");
+        let known = at(&|e| matches!(e, E::Speakers(_))).expect("a speakers event");
+        let done = events.last().unwrap().1;
+        println!("{how}: first line after {first_line:.2} s, speakers after {known:.2} s, all after {done:.2} s");
+        assert!(first_line < known, "{how}: lines come before the speakers");
+        let lines: Vec<_> = events.iter().filter_map(|(e, _)| if let E::Line(l) = e { Some(l.clone()) } else { None }).collect();
+        assert!(lines.iter().enumerate().all(|(i, l)| l.index == i), "{how}: lines are numbered in order");
+        let E::Speakers(s) = &events.iter().find(|(e, _)| matches!(e, E::Speakers(_))).unwrap().0 else { unreachable!() };
+        let before = lines.iter().take_while(|l| l.speaker.is_none()).count();
+        assert_eq!(s.len(), before, "{how}: a speaker for every line sent before");
+        assert!(s.iter().all(|x| x.as_deref().is_some_and(|x| x.starts_with('S'))), "{s:?}");
+        assert!(lines[before..].iter().all(|l| l.speaker.is_some()), "{how}: later lines come with their speaker");
+        let segments: Vec<_> = events.iter().filter_map(|(e, _)| if let E::Segment(s) = e { Some(s.clone()) } else { None }).collect();
+        assert_eq!(segments, t.segments, "{how}: every segment arrives once, as final");
+        assert!(t.segments.iter().all(|s| s.speaker.is_some()));
+        assert!(t.text.contains("Guten Morgen"), "{}", t.text);
+    };
+    let record = |events: std::sync::Arc<std::sync::Mutex<Vec<(E, f64)>>>| {
+        let t0 = std::time::Instant::now();
+        move |e: E| events.lock().unwrap().push((e, t0.elapsed().as_secs_f64()))
+    };
+
+    // Built in.
+    let engine = localrouter_client::embedded::Engine::new(localrouter_speech::catalog::WHISPER_TURBO_Q8).unwrap();
+    assert!(engine.ready(true));
+    let ai = LocalAi::Embedded(engine);
+    ai.transcribe(std::fs::read(&wav).unwrap(), "conv.wav", &opts).await.unwrap(); // warm up
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let t = ai.transcribe_file(&wav, &opts, &localrouter_client::Cancel::default(), record(events.clone())).await.unwrap();
+    {
+        let events = events.lock().unwrap();
+        assert_eq!(events[0].0, E::Phase("decode"));
+        assert_eq!(events[1].0, E::Phase("transcribe"));
+        check(&events, &t, "built in");
+    }
+
+    // Through the service.
+    let d = start_real_cache().await;
+    let Presence::Running(client) = discover_in(d.dir.path()).await else { panic!("Local Router should be running") };
+    let manifest: localrouter_client::ConnectRequest = serde_json::from_value(scribely_manifest()).unwrap();
+    let approve = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rid = d.sock("POST", "/lr/v1/connect", Some(scribely_manifest())).await.json()["request_id"].as_str().unwrap().to_string();
+        d.sock("POST", &format!("/lr/v1/admin/connect/{rid}"), Some(json!({ "approve": true }))).await;
+    };
+    let (app, ()) = tokio::join!(client.connect(&manifest, None), approve);
+    app.unwrap();
+    let t0 = std::time::Instant::now();
+    while d.sock("GET", "/lr/v1/health", None).await.json()["hf_cache"]["state"] != "ok" {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "cache never ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let opts = TranscribeOptions { model: Some(localrouter_speech::catalog::whisper_model_id(&localrouter_speech::catalog::WHISPER_TURBO_Q8)), ..opts };
+    client.transcribe(std::fs::read(&wav).unwrap(), "conv.wav", &opts).await.unwrap(); // warm up
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut sink = record(events.clone());
+    let t = client.transcribe_file_with_progress(&wav, &opts, &mut sink).await.unwrap();
+    check(&events.lock().unwrap(), &t, "through the service");
+}

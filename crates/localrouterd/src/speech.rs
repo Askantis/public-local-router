@@ -127,25 +127,39 @@ impl Speech {
         self.asr.lock().unwrap().as_ref().is_some_and(|(id, _)| id == model_id)
     }
 
-    /// [`Speech::transcribe`], handing each finished turn to `sink` (with
-    /// short speaker labels) as soon as it's final.
+    /// [`Speech::transcribe`], reporting lines and final turns (with short
+    /// speaker labels) as they're ready. Speakers are separated while the
+    /// words are written ([`localrouter_speech::transcribe_live`]).
     pub fn transcribe_streaming(
         &self,
         audio: &Audio,
         req: &TranscribeRequest,
-        sink: &mut dyn FnMut(&localrouter_speech::TranscriptTurn),
+        on: &mut dyn FnMut(localrouter_speech::Update<'_>),
     ) -> Result<localrouter_speech::Transcript> {
+        use localrouter_speech::{Line, Speakers, TranscriptTurn, Update};
         let asr = self.asr_for(&req.model_id)?;
         let opts = AsrOptions { language: req.language.clone(), prompt: req.prompt.clone(), threads: 0 };
-        let turns = match (&req.segments, req.diarize) {
-            (Some(s), _) => Some(s.clone()),
-            (None, true) => Some(localrouter_speech::merge_same_speaker(&self.diarize(audio)?)),
-            (None, false) => None,
+        // Load the speaker models here, so a missing one fails before any work.
+        let mut slot = None;
+        if req.segments.is_none() && req.diarize {
+            self.with_diarizer(|_| Ok(()))?;
+            slot = Some(self.diarizer.lock().unwrap());
+        }
+        let speakers = match (&req.segments, slot.as_mut()) {
+            (Some(s), _) => Speakers::Known(s.clone()),
+            (None, Some(guard)) => {
+                let d = guard.as_mut().context("speaker models aren't loaded")?;
+                Speakers::Separate(Box::new(move || d.run(&audio.samples)))
+            }
+            (None, None) => Speakers::None,
         };
-        let mut relabelled = |turn: &localrouter_speech::TranscriptTurn| {
-            sink(&localrouter_speech::TranscriptTurn { speaker: short_label(&turn.speaker), ..turn.clone() })
+        let mut relabelled = |u: Update<'_>| match u {
+            Update::Line(l) => on(Update::Line(&Line { speaker: l.speaker.as_deref().map(short_label), ..l.clone() })),
+            Update::Speakers(s) => on(Update::Speakers(&s.iter().map(|x| x.as_deref().map(short_label)).collect::<Vec<_>>())),
+            Update::Turn(t) => on(Update::Turn(&TranscriptTurn { speaker: short_label(&t.speaker), ..t.clone() })),
+            other => on(other),
         };
-        let mut t = localrouter_speech::transcribe_turns_streaming(audio, &asr, turns, &opts, Strategy::Windows, &mut |_, _| {}, &mut relabelled)?;
+        let mut t = localrouter_speech::transcribe_live(audio, &asr, speakers, &opts, Strategy::Windows, &mut |_, _| {}, &mut relabelled)?;
         for turn in &mut t.turns {
             turn.speaker = short_label(&turn.speaker);
         }
@@ -195,6 +209,16 @@ pub fn segment_json(i: usize, turn: &localrouter_speech::TranscriptTurn, format:
         s["no_speech_prob"] = json!(r3(p as f64));
     }
     s
+}
+
+/// A line for `lr.transcript.line`: `{ index, start, end, text, speaker }`,
+/// `speaker` only with `lr_speakers_json` (`null` while not known yet).
+pub fn line_json(l: &localrouter_speech::Line, format: &str, req: &TranscribeRequest) -> Value {
+    let mut v = json!({ "index": l.index, "start": r3(l.start + req.offset), "end": r3(l.end + req.offset), "text": l.text });
+    if format == "lr_speakers_json" {
+        v["speaker"] = json!(l.speaker);
+    }
+    v
 }
 
 pub fn render(t: &localrouter_speech::Transcript, format: &str, req: &TranscribeRequest) -> (Value, Option<String>) {

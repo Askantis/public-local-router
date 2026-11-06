@@ -565,6 +565,11 @@ Speakers are numbered `S1`, `S2`, … in the order they first speak. Naming them
 | `transcript.text.segment` | `{ "type", "segment" }`: one finished segment. Segments that were sent don't change later. |
 | `transcript.text.done` | `{ "type", … }`: the complete response, in the requested format |
 | `error` | `{ "type": "error", "error": { … } }`: the error object of section 12; the stream then ends |
+| `lr.transcript.line` | `{ "type", "line": { "index", "start", "end", "text", "speaker"? } }`: a line as soon as it's written, for showing progress. Lines are numbered from 0. They are cut as Whisper wrote them, which may differ from the final segments. With `lr_speakers_json`, `speaker` is the speaker talking most of the line, or `null` while the speakers aren't known yet. |
+| `lr.transcript.speakers` | `{ "type", "speakers": ["S1", "S2", …] }`, with `lr_speakers_json`: the speakers became known. The array has the speaker of every line sent so far, in the order of `index`. Lines sent after it come with their speaker. |
+| `lr.transcript.phase` | `{ "type", "phase": "speakers" }`, with `lr_speakers_json`: all words are written and the speakers are still being separated. |
+
+When speakers are separated, Local Router separates them while it writes the words. Lines then come from the start, without speakers. The segments, which carry speakers and don't change, come once the speakers are known. Without speakers, or with `lr_segments`, each line comes with its speaker and the segments follow as they're finished. The `lr.` events were added later in version 1. A client that doesn't know them ignores them (section 13), and one that wants lines from an older Local Router can show the segments instead.
 
 **Live transcription** is a series of short requests. The app records the audio itself, so the microphone permission belongs to the app. Every few seconds it sends the newest stretch of audio, up to 30 seconds, as WAV with `lr_priority=live` and `lr_offset` set to where that stretch starts in the recording. Windows MAY overlap. Version 1 has no session API, and separating speakers in live mode is left to a later version.
 
