@@ -246,6 +246,10 @@ pub struct TranscribeOptions {
     pub offset: f64,
     /// `live` for live windows, `batch` for work nobody waits for (`lr_priority`).
     pub priority: Option<String>,
+    /// Each speaker's voiceprint in [`Transcript::speakers`] (`lr_voiceprints`),
+    /// when speakers are separated (not with `segments`). Biometric data:
+    /// ask only to recognise people the user chose to remember.
+    pub voiceprints: bool,
 }
 
 /// A download Local Router runs for the app (PROTOCOL.md 8).
@@ -319,7 +323,7 @@ pub struct LiveLine {
 }
 
 /// A transcript, as `verbose_json` / `lr_speakers_json` (PROTOCOL.md 11.4).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Transcript {
     #[serde(default)]
     pub language: String,
@@ -332,6 +336,50 @@ pub struct Transcript {
     /// Where two speakers talk at once (`lr_speakers_json`; empty without speakers).
     #[serde(default)]
     pub overlaps: Vec<Overlap>,
+    /// The speakers in the order they first speak (`lr_speakers_json`), with
+    /// their voiceprints when [`TranscribeOptions::voiceprints`] asked for
+    /// them. Empty without speakers, and from an older Local Router.
+    #[serde(default)]
+    pub speakers: Vec<SpeakerInfo>,
+}
+
+/// A speaker of a [`Transcript`] (PROTOCOL.md 11.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeakerInfo {
+    /// The label in the segments (`S1`, …).
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voiceprint: Option<Voiceprint>,
+}
+
+/// A speaker's voice, to recognise them in other recordings (PROTOCOL.md
+/// 11.4 `lr_voiceprints`): biometric data, for the app to keep only with
+/// consent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Voiceprint {
+    /// The embedding model; voiceprints of different models don't compare.
+    pub model: String,
+    /// L2-normalised: two voiceprints compare by their dot product.
+    pub vector: Vec<f32>,
+    /// Seconds of speech it comes from: more is more reliable.
+    #[serde(default)]
+    pub speech_s: f64,
+}
+
+impl Voiceprint {
+    /// Cosine similarity, from −1 to 1; `None` for different models or sizes.
+    pub fn similarity(&self, other: &Voiceprint) -> Option<f32> {
+        if self.model != other.model || self.vector.len() != other.vector.len() {
+            return None;
+        }
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for (a, b) in self.vector.iter().zip(&other.vector) {
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+        }
+        Some(if na == 0.0 || nb == 0.0 { 0.0 } else { (dot / (na.sqrt() * nb.sqrt())) as f32 })
+    }
 }
 
 /// Two speakers talking at once, at least half a second (PROTOCOL.md 11.4).
@@ -592,6 +640,9 @@ impl Client {
         }
         if let Some(p) = &opts.priority {
             form = form.text("lr_priority", p.clone());
+        }
+        if opts.voiceprints && opts.speakers && opts.segments.is_none() {
+            form = form.text("lr_voiceprints", "true");
         }
         form
     }
@@ -909,6 +960,8 @@ pub mod embedded {
     //! The speech engine inside the app, using the standard Hugging Face cache.
     use std::sync::{Arc, Mutex};
 
+    use std::collections::BTreeMap;
+
     use localrouter_speech::{Asr, AsrOptions, Diarizer, Speakers, Strategy, Turn, Update, catalog};
 
     use super::*;
@@ -954,6 +1007,11 @@ pub mod embedded {
         pub fn ready(&self, speakers: bool) -> bool {
             let asr = matches!(catalog::whisper_present(&self.inner.cache, self.inner.whisper), Ok(Some(_)));
             asr && (!speakers || matches!(catalog::speaker_models_present(&self.inner.cache), Ok(Some(_))))
+        }
+
+        /// Whether the speaker models are in the cache ([`Engine::voiceprints_of_file`] needs only them).
+        pub fn ready_for_voices(&self) -> bool {
+            matches!(catalog::speaker_models_present(&self.inner.cache), Ok(Some(_)))
         }
 
         /// The speech model, loaded on first use.
@@ -1103,6 +1161,10 @@ pub mod embedded {
             })?
             .map_err(|e| err(format!("{e:#}")))?;
             // The speaker separation just run knows where speakers overlapped.
+            let voiceprints: BTreeMap<String, localrouter_speech::Voiceprint> = match slot.as_ref().and_then(|g| g.as_ref()) {
+                Some(d) if opts.voiceprints && opts.segments.is_none() => d.voiceprints().clone(),
+                _ => BTreeMap::new(),
+            };
             let overlaps = match slot.as_ref().and_then(|g| g.as_ref()) {
                 Some(d) if opts.segments.is_none() => d
                     .overlaps()
@@ -1118,8 +1180,39 @@ pub mod embedded {
                 segments: t.turns.iter().map(segment).collect(),
                 model: Some(catalog::whisper_model_id(&self.inner.whisper)),
                 overlaps,
+                speakers: if with_speakers {
+                    t.speakers.iter().map(|s| SpeakerInfo { id: short_label(s), voiceprint: voiceprints.get(s).map(voiceprint) }).collect()
+                } else {
+                    Vec::new()
+                },
             })
         }
+
+        /// Voiceprints of the speakers of `turns` (labels as given) in the
+        /// audio file at `path`: for a transcript made before, or edited
+        /// since. Runs here even when Local Router is connected (the speaker
+        /// models are in the same standard cache). Slow work: call it off
+        /// the main thread. Speakers with too little speech alone have none.
+        pub fn voiceprints_of_file(&self, path: &Path, turns: &[Segment], cancel: &Cancel) -> Result<BTreeMap<String, Voiceprint>> {
+            let _job = self.inner.job.lock().unwrap_or_else(|e| e.into_inner());
+            stop_if(cancel)?;
+            let audio = localrouter_audio::decode_file(path).map_err(|e| err(format!("{e:#}")))?;
+            stop_if(cancel)?;
+            let turns: Vec<Turn> = turns.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone().unwrap_or_else(|| "S1".into()) }).collect();
+            let mut guard = self.inner.diarizer.lock().unwrap();
+            if guard.is_none() {
+                let dir = catalog::speaker_models_present(&self.inner.cache).map_err(err)?.ok_or_else(|| err("speaker models aren't downloaded"))?;
+                *guard = Some(Diarizer::load(&dir).map_err(|e| err(format!("{e:#}")))?);
+            }
+            let d = guard.as_mut().expect("loaded above");
+            let out = d.voiceprints_of(&audio.samples, &turns).map_err(|e| err(format!("{e:#}")))?;
+            stop_if(cancel)?;
+            Ok(out.iter().map(|(k, v)| (k.clone(), voiceprint(v))).collect())
+        }
+    }
+
+    fn voiceprint(v: &localrouter_speech::Voiceprint) -> Voiceprint {
+        Voiceprint { model: v.model.clone(), vector: v.vector.clone(), speech_s: v.speech_s }
     }
 
     fn stop_if(cancel: &Cancel) -> Result<()> {
@@ -1268,5 +1361,18 @@ mod tests {
         let plain = json!({ "task": "transcribe", "language": "de", "duration": 2.0, "text": "Hoi", "segments": [{ "id": 0, "start": 0.1, "end": 0.5, "text": "Hoi" }] });
         let t: Transcript = serde_json::from_value(plain).unwrap();
         assert_eq!(t.segments[0].speaker, None);
+        assert!(t.speakers.is_empty());
+    }
+
+    #[test]
+    fn voiceprints_are_optional_per_speaker() {
+        let v = json!({ "language": "de", "duration": 2.0, "text": "", "segments": [],
+            "speakers": [{ "id": "S1", "voiceprint": { "model": "m", "vector": [0.6, 0.8], "speech_s": 12.5 } }, { "id": "S2" }] });
+        let t: Transcript = serde_json::from_value(v).unwrap();
+        let a = t.speakers[0].voiceprint.clone().unwrap();
+        assert_eq!((a.speech_s, t.speakers[1].voiceprint.is_none()), (12.5, true));
+        let b = Voiceprint { vector: vec![0.8, 0.6], ..a.clone() };
+        assert!((a.similarity(&b).unwrap() - 0.96).abs() < 1e-6);
+        assert_eq!(a.similarity(&Voiceprint { model: "other".into(), ..b }), None);
     }
 }

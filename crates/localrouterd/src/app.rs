@@ -1128,6 +1128,7 @@ async fn transcriptions(State(st): State<Shared>, caller: Caller, mp: Multipart)
         segments,
         offset: up.get("lr_offset").and_then(|o| o.parse().ok()).unwrap_or(0.0),
         words: granularities.contains(&"word"),
+        voiceprints: diarize && up.flag("lr_voiceprints"),
     };
     let audio = decode(up).await?;
     let audio_s = audio.duration_s();

@@ -12,14 +12,16 @@
 pub mod asr;
 pub mod catalog;
 pub mod diarize;
+pub mod voice;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use serde::Serialize;
 
 pub use asr::{Aheads, Asr, AsrOptions, AsrSegment, Word};
 pub use diarize::{Diarizer, Overlap, Turn, detect_overlaps};
+pub use voice::{VOICEPRINT_DIM, VOICEPRINT_MODEL, VoiceEmbedder, Voiceprint};
 pub use localrouter_audio::{Audio, SAMPLE_RATE};
 
 /// Gap between two turns of the same speaker that still counts as one turn.
@@ -56,6 +58,10 @@ pub struct Transcript {
     /// Where two speakers talk at once, when the caller's [`Diarizer`] knows
     /// ([`Diarizer::overlaps`] after the transcription); empty otherwise.
     pub overlaps: Vec<Overlap>,
+    /// Each speaker's voiceprint, by speaker, when the caller asked for them
+    /// ([`Diarizer::voiceprints`] after the transcription); empty otherwise.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub voiceprints: BTreeMap<String, Voiceprint>,
 }
 
 /// Progress of [`transcribe`]: `(steps done, steps total)`.
@@ -288,7 +294,7 @@ fn finish(duration_s: f64, language: Option<String>, turns: Vec<TranscriptTurn>)
             speakers.push(t.speaker.clone());
         }
     }
-    Transcript { duration_s, language, speakers, turns, overlaps: Vec::new() }
+    Transcript { duration_s, language, speakers, turns, overlaps: Vec::new(), voiceprints: BTreeMap::new() }
 }
 
 /// [`Strategy::Windows`] with known turns: pack consecutive speaker turns

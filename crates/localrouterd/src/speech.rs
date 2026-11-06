@@ -171,6 +171,15 @@ impl Speech {
             turn.speaker = short_label(&turn.speaker);
         }
         t.speakers = t.speakers.iter().map(|s| short_label(s)).collect();
+        // Only when asked (`lr_voiceprints`), and only of speakers in the answer.
+        if let (true, Some(d)) = (req.voiceprints, slot.as_ref().and_then(|g| g.as_ref())) {
+            t.voiceprints = d
+                .voiceprints()
+                .iter()
+                .map(|(s, v)| (short_label(s), v.clone()))
+                .filter(|(s, _)| t.speakers.contains(s))
+                .collect();
+        }
         Ok(t)
     }
 }
@@ -192,6 +201,8 @@ pub struct TranscribeRequest {
     pub segments: Option<Vec<Turn>>,
     pub offset: f64,
     pub words: bool,
+    /// Add each speaker's voiceprint (`lr_voiceprints`, with speakers separated here).
+    pub voiceprints: bool,
 }
 
 /// The answer in one of the formats of PROTOCOL.md 11.4.
@@ -247,7 +258,14 @@ pub fn render(t: &localrouter_speech::Transcript, format: &str, req: &Transcribe
                 v["words"] = json!(t.turns.iter().flat_map(|turn| words_of(turn, off)).collect::<Vec<_>>());
             }
             if format == "lr_speakers_json" {
-                v["speakers"] = json!(t.speakers.iter().map(|s| json!({ "id": s })).collect::<Vec<_>>());
+                v["speakers"] = json!(t
+                    .speakers
+                    .iter()
+                    .map(|s| match t.voiceprints.get(s) {
+                        Some(vp) => json!({ "id": s, "voiceprint": { "model": vp.model, "vector": vp.vector, "speech_s": vp.speech_s } }),
+                        None => json!({ "id": s }),
+                    })
+                    .collect::<Vec<_>>());
                 v["overlaps"] = json!(t.overlaps.iter().map(|o| json!({ "start": r3(o.start + off), "end": r3(o.end + off), "speakers": o.speakers, "duration_s": o.duration_s })).collect::<Vec<_>>());
             }
             (v, None)
@@ -317,11 +335,24 @@ mod tests {
                 TranscriptTurn { start: 1.5, end: 2.0, speaker: "S2".into(), text: "Grüezi".into(), words: vec![w("Grüezi", 1.5, 2.0)], no_speech_prob: None },
             ],
             overlaps: vec![localrouter_speech::Overlap { start: 0.8, end: 1.6, speakers: vec!["S1".into(), "S2".into()], duration_s: 0.8 }],
+            voiceprints: Default::default(),
         }
     }
 
+    #[test]
+    fn voiceprints_go_with_their_speaker() {
+        let mut t = sample();
+        let vp = localrouter_speech::Voiceprint { model: localrouter_speech::VOICEPRINT_MODEL.into(), vector: vec![0.6, 0.8], speech_s: 0.7 };
+        t.voiceprints.insert("S1".into(), vp);
+        let (v, _) = render(&t, "lr_speakers_json", &req(false, 0.0));
+        assert_eq!(v["speakers"][0], json!({ "id": "S1", "voiceprint": { "model": localrouter_speech::VOICEPRINT_MODEL, "vector": [0.6f32, 0.8f32], "speech_s": 0.7 } }));
+        assert_eq!(v["speakers"][1], json!({ "id": "S2" }));
+        let (v, _) = render(&t, "verbose_json", &req(false, 0.0));
+        assert!(v.get("speakers").is_none());
+    }
+
     fn req(words: bool, offset: f64) -> TranscribeRequest {
-        TranscribeRequest { model_id: String::new(), language: None, prompt: None, diarize: true, segments: None, offset, words }
+        TranscribeRequest { model_id: String::new(), language: None, prompt: None, diarize: true, segments: None, offset, words, voiceprints: false }
     }
 
     #[test]
