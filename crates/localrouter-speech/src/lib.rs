@@ -19,7 +19,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 pub use asr::{Aheads, Asr, AsrOptions, AsrSegment, Word};
-pub use diarize::{Diarizer, Turn};
+pub use diarize::{Diarizer, Overlap, Turn, detect_overlaps};
 pub use localrouter_audio::{Audio, SAMPLE_RATE};
 
 /// Gap between two turns of the same speaker that still counts as one turn.
@@ -53,6 +53,9 @@ pub struct Transcript {
     pub language: Option<String>,
     pub speakers: Vec<String>,
     pub turns: Vec<TranscriptTurn>,
+    /// Where two speakers talk at once, when the caller's [`Diarizer`] knows
+    /// ([`Diarizer::overlaps`] after the transcription); empty otherwise.
+    pub overlaps: Vec<Overlap>,
 }
 
 /// Progress of [`transcribe`]: `(steps done, steps total)`.
@@ -285,7 +288,7 @@ fn finish(duration_s: f64, language: Option<String>, turns: Vec<TranscriptTurn>)
             speakers.push(t.speaker.clone());
         }
     }
-    Transcript { duration_s, language, speakers, turns }
+    Transcript { duration_s, language, speakers, turns, overlaps: Vec::new() }
 }
 
 /// [`Strategy::Windows`] with known turns: pack consecutive speaker turns

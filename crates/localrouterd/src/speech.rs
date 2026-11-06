@@ -160,6 +160,13 @@ impl Speech {
             other => on(other),
         };
         let mut t = localrouter_speech::transcribe_live(audio, &asr, speakers, &opts, Strategy::Windows, &mut |_, _| {}, &mut relabelled)?;
+        if let Some(d) = slot.as_ref().and_then(|g| g.as_ref()) {
+            t.overlaps = d
+                .overlaps()
+                .iter()
+                .map(|o| localrouter_speech::Overlap { speakers: o.speakers.iter().map(|s| short_label(s)).collect(), ..o.clone() })
+                .collect();
+        }
         for turn in &mut t.turns {
             turn.speaker = short_label(&turn.speaker);
         }
@@ -241,7 +248,7 @@ pub fn render(t: &localrouter_speech::Transcript, format: &str, req: &Transcribe
             }
             if format == "lr_speakers_json" {
                 v["speakers"] = json!(t.speakers.iter().map(|s| json!({ "id": s })).collect::<Vec<_>>());
-                v["overlaps"] = json!([]);
+                v["overlaps"] = json!(t.overlaps.iter().map(|o| json!({ "start": r3(o.start + off), "end": r3(o.end + off), "speakers": o.speakers, "duration_s": o.duration_s })).collect::<Vec<_>>());
             }
             (v, None)
         }
@@ -309,6 +316,7 @@ mod tests {
                 TranscriptTurn { start: 0.3, end: 1.0, speaker: "S1".into(), text: "Hoi Thomas".into(), words: vec![w("Hoi", 0.3, 0.6), w("Thomas", 0.6, 1.0)], no_speech_prob: Some(0.012) },
                 TranscriptTurn { start: 1.5, end: 2.0, speaker: "S2".into(), text: "Grüezi".into(), words: vec![w("Grüezi", 1.5, 2.0)], no_speech_prob: None },
             ],
+            overlaps: vec![localrouter_speech::Overlap { start: 0.8, end: 1.6, speakers: vec!["S1".into(), "S2".into()], duration_s: 0.8 }],
         }
     }
 
@@ -322,7 +330,11 @@ mod tests {
         assert_eq!(v["speakers"], json!([{ "id": "S1" }, { "id": "S2" }]));
         assert_eq!(v["segments"][1]["speaker"], "S2");
         assert_eq!(v["words"].as_array().unwrap().len(), 3);
+        assert_eq!(v["overlaps"], json!([{ "start": 0.8, "end": 1.6, "speakers": ["S1", "S2"], "duration_s": 0.8 }]));
+        let (v, _) = render(&sample(), "lr_speakers_json", &req(false, 10.0));
+        assert_eq!(v["overlaps"][0]["start"], 10.8);
         let (v, _) = render(&sample(), "verbose_json", &req(false, 10.0));
+        assert!(v.get("overlaps").is_none());
         assert!(v.get("words").is_none() && v["segments"][0].get("speaker").is_none());
         assert_eq!(v["segments"][0]["start"], 10.3, "lr_offset shifts every time");
         let (v, _) = render(&sample(), "json", &req(false, 0.0));

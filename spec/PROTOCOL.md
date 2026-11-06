@@ -551,11 +551,13 @@ The audio is processed in memory and never stored (section 14). A file path can'
   "speakers": [ { "id": "S1" }, { "id": "S2" } ],
   "segments": [ { "id": 0, "start": 0.32, "end": 2.10, "speaker": "S1", "text": "…",
                   "words": [ { "word": "Hoi", "start": 0.32, "end": 0.58, "probability": 0.97 } ] } ],
-  "overlaps": [ { "start": 5.10, "end": 5.60, "speakers": ["S1", "S2"] } ]
+  "overlaps": [ { "start": 5.10, "end": 5.60, "speakers": ["S1", "S2"], "duration_s": 0.50 } ]
 }
 ```
 
 Speakers are numbered `S1`, `S2`, … in the order they first speak. Naming them is up to the app. With `lr_segments`, the speakers are the ones the app supplied.
+
+`overlaps` are the stretches of at least 0.5 s where two speakers talk at once, from the speaker separation before each moment is given to one speaker (the segments never overlap). Empty with `lr_segments`.
 
 **Streaming** (`stream=true`) sends these events, then closes the stream. Every `data` object carries its event name in a `type` field, as in OpenAI's API:
 
