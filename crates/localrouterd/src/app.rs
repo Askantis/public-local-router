@@ -1169,12 +1169,27 @@ fn transcription_stream(st: Shared, key: String, model: String, format: String, 
         let tx2 = tx.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut n = 0usize;
-            let mut sink = |turn: &localrouter_speech::TranscriptTurn| {
-                let seg = speech::segment_json(n, turn, &fmt, &req);
-                n += 1;
-                let delta = if n == 1 { turn.text.clone() } else { format!(" {}", turn.text) };
-                let _ = tx2.blocking_send(SseEvent::default().event("transcript.text.delta").data(json!({ "type": "transcript.text.delta", "delta": delta }).to_string()));
-                let _ = tx2.blocking_send(SseEvent::default().event("transcript.text.segment").data(json!({ "type": "transcript.text.segment", "segment": seg }).to_string()));
+            let send = |kind: &str, data: Value| {
+                let _ = tx2.blocking_send(SseEvent::default().event(kind).data(data.to_string()));
+            };
+            let mut sink = |u: localrouter_speech::Update<'_>| match u {
+                localrouter_speech::Update::Turn(turn) => {
+                    let seg = speech::segment_json(n, turn, &fmt, &req);
+                    n += 1;
+                    let delta = if n == 1 { turn.text.clone() } else { format!(" {}", turn.text) };
+                    send("transcript.text.delta", json!({ "type": "transcript.text.delta", "delta": delta }));
+                    send("transcript.text.segment", json!({ "type": "transcript.text.segment", "segment": seg }));
+                }
+                localrouter_speech::Update::Line(l) => {
+                    send("lr.transcript.line", json!({ "type": "lr.transcript.line", "line": speech::line_json(l, &fmt, &req) }));
+                }
+                localrouter_speech::Update::Speakers(s) if fmt == "lr_speakers_json" => {
+                    send("lr.transcript.speakers", json!({ "type": "lr.transcript.speakers", "speakers": s }));
+                }
+                localrouter_speech::Update::WaitingForSpeakers if fmt == "lr_speakers_json" => {
+                    send("lr.transcript.phase", json!({ "type": "lr.transcript.phase", "phase": "speakers" }));
+                }
+                _ => {}
             };
             st2.speech.transcribe_streaming(&audio, &req, &mut sink).map(|t| (t, req))
         })

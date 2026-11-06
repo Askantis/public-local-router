@@ -304,6 +304,20 @@ pub struct TranscriptSegment {
     pub words: Vec<Word>,
 }
 
+/// A line as it's written, for showing progress (`lr.transcript.line`,
+/// PROTOCOL.md 11.4). Lines may be cut differently from the final segments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveLine {
+    /// From 0, in order; [`TranscribeEvent::Speakers`] refers to lines by it.
+    pub index: usize,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    /// `None` without speakers, and while they aren't known yet.
+    #[serde(default)]
+    pub speaker: Option<String>,
+}
+
 /// A transcript, as `verbose_json` / `lr_speakers_json` (PROTOCOL.md 11.4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transcript {
@@ -457,22 +471,34 @@ impl Client {
         audio: Vec<u8>,
         filename: &str,
         opts: &TranscribeOptions,
-        on_segment: impl FnMut(TranscriptSegment),
+        mut on_segment: impl FnMut(TranscriptSegment),
     ) -> Result<Transcript> {
-        self.stream_transcription(bytes_part(audio, filename), opts, on_segment).await
+        self.stream_transcription(bytes_part(audio, filename), opts, |e| if let TranscribeEvent::Segment(s) = e { on_segment(s) }).await
+    }
+
+    /// [`transcribe_streaming`](Self::transcribe_streaming) with lines as
+    /// they're written and speakers once known, besides the final segments.
+    pub async fn transcribe_with_progress(&self, audio: Vec<u8>, filename: &str, opts: &TranscribeOptions, on_event: impl FnMut(TranscribeEvent)) -> Result<Transcript> {
+        self.stream_transcription(bytes_part(audio, filename), opts, on_event).await
     }
 
     /// [`transcribe_streaming`](Self::transcribe_streaming) of a file, sent
     /// from disk as it's read (a long video isn't held in memory).
-    pub async fn transcribe_file_streaming(&self, path: &Path, opts: &TranscribeOptions, on_segment: impl FnMut(TranscriptSegment)) -> Result<Transcript> {
+    pub async fn transcribe_file_streaming(&self, path: &Path, opts: &TranscribeOptions, mut on_segment: impl FnMut(TranscriptSegment)) -> Result<Transcript> {
+        self.transcribe_file_with_progress(path, opts, |e| if let TranscribeEvent::Segment(s) = e { on_segment(s) }).await
+    }
+
+    /// [`transcribe_with_progress`](Self::transcribe_with_progress) of a file, sent from disk as it's read.
+    pub async fn transcribe_file_with_progress(&self, path: &Path, opts: &TranscribeOptions, on_event: impl FnMut(TranscribeEvent)) -> Result<Transcript> {
         let part = reqwest::multipart::Part::file(path).await.map_err(|e| Error::Other(format!("reading {}: {e}", path.display())))?;
-        self.stream_transcription(part, opts, on_segment).await
+        self.stream_transcription(part, opts, on_event).await
     }
 
     /// No overall limit: a long file streams for long. Silence longer than
     /// [`STREAM_IDLE_TIMEOUT`] (before the answer starts or between events)
-    /// means Local Router is stuck.
-    async fn stream_transcription(&self, file: reqwest::multipart::Part, opts: &TranscribeOptions, mut on_segment: impl FnMut(TranscriptSegment)) -> Result<Transcript> {
+    /// means Local Router is stuck. A Local Router that sends no lines (an
+    /// older one) gets a line for every segment.
+    async fn stream_transcription(&self, file: reqwest::multipart::Part, opts: &TranscribeOptions, mut on_event: impl FnMut(TranscribeEvent)) -> Result<Transcript> {
         use futures::StreamExt;
         let form = self.transcribe_form(file, opts).text("stream", "true");
         let req = self.http.post(self.url("/v1/audio/transcriptions")).multipart(form);
@@ -480,6 +506,7 @@ impl Client {
         let model = resp.headers().get("LR-Resolved-Model").and_then(|v| v.to_str().ok()).map(str::to_owned);
         let mut body = resp.bytes_stream();
         let mut buf = String::new();
+        let (mut lines_sent, mut segments) = (false, 0usize);
         loop {
             let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await {
                 Ok(Some(chunk)) => chunk.map_err(|e| Error::Transport(e.to_string()))?,
@@ -493,10 +520,26 @@ impl Client {
                 let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
                 match v["type"].as_str() {
                     Some("transcript.text.segment") => {
-                        if let Ok(s) = serde_json::from_value(v["segment"].clone()) {
-                            on_segment(s);
+                        if let Ok(s) = serde_json::from_value::<TranscriptSegment>(v["segment"].clone()) {
+                            if !lines_sent {
+                                on_event(TranscribeEvent::Line(LiveLine { index: segments, start: s.start, end: s.end, text: s.text.clone(), speaker: s.speaker.clone() }));
+                            }
+                            segments += 1;
+                            on_event(TranscribeEvent::Segment(s));
                         }
                     }
+                    Some("lr.transcript.line") => {
+                        if let Ok(l) = serde_json::from_value(v["line"].clone()) {
+                            lines_sent = true;
+                            on_event(TranscribeEvent::Line(l));
+                        }
+                    }
+                    Some("lr.transcript.speakers") => {
+                        if let Ok(s) = serde_json::from_value(v["speakers"].clone()) {
+                            on_event(TranscribeEvent::Speakers(s));
+                        }
+                    }
+                    Some("lr.transcript.phase") if v["phase"] == "speakers" => on_event(TranscribeEvent::Phase("speakers")),
                     Some("transcript.text.done") => {
                         let mut t: Transcript = serde_json::from_value(v).map_err(|e| Error::Other(e.to_string()))?;
                         t.model = model;
@@ -714,11 +757,19 @@ pub enum LiveReady {
 /// What a transcription is doing, for progress in the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscribeEvent {
-    /// `decode`, `speakers` or `transcribe` (embedded only; Local Router
-    /// does these steps on its side).
+    /// `decode`, `transcribe` or `speakers`. With speakers separated, they
+    /// are separated while the words are written: `transcribe` comes first,
+    /// and `speakers` once all words are written and the speakers are still
+    /// being separated (not at all when they were done first). Through Local
+    /// Router only `transcribe`, and `speakers` from one that says.
     Phase(&'static str),
     /// 0.0 to 1.0 of the current phase, when it's known.
     Fraction(f64),
+    /// A line as soon as it's written, to show; its speaker may come later.
+    Line(LiveLine),
+    /// Speakers became known: the speaker of each line sent so far, by its
+    /// index. Lines after this come with their speaker.
+    Speakers(Vec<Option<String>>),
     /// A finished segment; segments arrive in order and don't change later.
     Segment(TranscriptSegment),
 }
@@ -760,7 +811,7 @@ impl LocalAi {
         match self {
             LocalAi::Connected(c) => {
                 on_event(TranscribeEvent::Phase("transcribe"));
-                c.transcribe_streaming(audio, filename, opts, move |s| on_event(TranscribeEvent::Segment(s))).await
+                c.transcribe_with_progress(audio, filename, opts, on_event).await
             }
             #[cfg(feature = "embedded")]
             LocalAi::Embedded(e) => {
@@ -789,7 +840,7 @@ impl LocalAi {
         match self {
             LocalAi::Connected(c) => {
                 on_event(TranscribeEvent::Phase("transcribe"));
-                cancel.run(c.transcribe_file_streaming(path, opts, move |s| on_event(TranscribeEvent::Segment(s)))).await
+                cancel.run(c.transcribe_file_with_progress(path, opts, on_event)).await
             }
             #[cfg(feature = "embedded")]
             LocalAi::Embedded(e) => {
@@ -844,7 +895,7 @@ pub mod embedded {
     //! The speech engine inside the app, using the standard Hugging Face cache.
     use std::sync::{Arc, Mutex};
 
-    use localrouter_speech::{Asr, AsrOptions, Diarizer, Strategy, Turn, catalog};
+    use localrouter_speech::{Asr, AsrOptions, Diarizer, Speakers, Strategy, Turn, Update, catalog};
 
     use super::*;
 
@@ -971,27 +1022,30 @@ pub mod embedded {
             self.run(&audio, opts, cancel, &mut on_event)
         }
 
-        /// Speakers (unless given), then the words. Between phases and windows
-        /// `cancel` is looked at.
+        /// The words, with speakers (unless given) separated at the same
+        /// time. Between phases and windows `cancel` is looked at; a speaker
+        /// separation under way is finished first.
         fn run(&self, audio: &localrouter_audio::Audio, opts: &TranscribeOptions, cancel: &Cancel, on_event: &mut (dyn FnMut(TranscribeEvent) + Send)) -> Result<Transcript> {
             stop_if(cancel)?;
             let asr = self.asr()?;
-            let turns: Option<Vec<Turn>> = match (&opts.segments, opts.speakers) {
-                (Some(s), _) => Some(s.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone().unwrap_or_else(|| "S1".into()) }).collect()),
-                (None, true) => {
-                    on_event(TranscribeEvent::Phase("speakers"));
-                    let mut slot = self.inner.diarizer.lock().unwrap();
-                    if slot.is_none() {
-                        let dir = catalog::speaker_models_present(&self.inner.cache)
-                            .map_err(err)?
-                            .ok_or_else(|| err("speaker models aren't downloaded"))?;
-                        *slot = Some(Diarizer::load(&dir).map_err(|e| err(format!("{e:#}")))?);
-                    }
-                    stop_if(cancel)?;
-                    let raw = slot.as_mut().unwrap().run(&audio.samples).map_err(|e| err(format!("{e:#}")))?;
-                    Some(localrouter_speech::merge_same_speaker(&localrouter_speech::label_speakers(raw)))
+            let mut slot = None;
+            if opts.segments.is_none() && opts.speakers {
+                let mut guard = self.inner.diarizer.lock().unwrap();
+                if guard.is_none() {
+                    let dir = catalog::speaker_models_present(&self.inner.cache)
+                        .map_err(err)?
+                        .ok_or_else(|| err("speaker models aren't downloaded"))?;
+                    *guard = Some(Diarizer::load(&dir).map_err(|e| err(format!("{e:#}")))?);
                 }
-                (None, false) => None,
+                slot = Some(guard);
+            }
+            let speakers = match (&opts.segments, slot.as_mut().and_then(|g| g.as_mut())) {
+                (Some(s), _) => Speakers::Known(s.iter().map(|s| Turn { start: s.start, end: s.end, speaker: s.speaker.clone().unwrap_or_else(|| "S1".into()) }).collect()),
+                (None, Some(d)) => {
+                    let samples = &audio.samples;
+                    Speakers::Separate(Box::new(move || d.run(samples)))
+                }
+                (None, None) => Speakers::None,
             };
             stop_if(cancel)?;
             on_event(TranscribeEvent::Phase("transcribe"));
@@ -1009,19 +1063,28 @@ pub mod embedded {
                     .map(|w| Word { word: w.word.clone(), start: w.start + offset, end: w.end + offset, probability: w.probability as f64 })
                     .collect(),
             };
+            let label = |s: &Option<String>| if with_speakers { s.as_deref().map(short_label) } else { None };
             let events = std::cell::RefCell::new(on_event);
             let t = until_cancelled(cancel, || {
-                localrouter_speech::transcribe_turns_streaming(
+                localrouter_speech::transcribe_live(
                     audio,
                     &asr,
-                    turns,
+                    speakers,
                     &asr_opts,
                     Strategy::Windows,
                     &mut |done, total| {
                         unwind_if(cancel);
                         (events.borrow_mut())(TranscribeEvent::Fraction(if total == 0 { 1.0 } else { done as f64 / total as f64 }))
                     },
-                    &mut |turn| (events.borrow_mut())(TranscribeEvent::Segment(segment(turn))),
+                    &mut |u| {
+                        let e = match u {
+                            Update::Line(l) => TranscribeEvent::Line(LiveLine { index: l.index, start: l.start + offset, end: l.end + offset, text: l.text.clone(), speaker: label(&l.speaker) }),
+                            Update::Speakers(s) => TranscribeEvent::Speakers(s.iter().map(label).collect()),
+                            Update::WaitingForSpeakers => TranscribeEvent::Phase("speakers"),
+                            Update::Turn(turn) => TranscribeEvent::Segment(segment(turn)),
+                        };
+                        (events.borrow_mut())(e)
+                    },
                 )
             })?
             .map_err(|e| err(format!("{e:#}")))?;
