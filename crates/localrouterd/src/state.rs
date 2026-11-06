@@ -49,11 +49,18 @@ pub struct KeyEntry {
 pub struct Settings {
     /// Askantis-signed apps connect without asking (PROTOCOL.md 5.2).
     pub auto_connect_askantis: bool,
+    /// Where new `hf` models go (PROTOCOL.md 2). Unset until the service
+    /// first starts, which then saves the default for this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_target: Option<localrouter_hf::Place>,
+    /// The folder for `download_target: custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_path: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_connect_askantis: true }
+        Settings { auto_connect_askantis: true, download_target: None, download_path: None }
     }
 }
 

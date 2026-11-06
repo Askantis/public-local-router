@@ -212,6 +212,42 @@ struct ConnectedApp: Identifiable, Hashable, Sendable {
     }
 }
 
+/// The `hf` store's folders (PROTOCOL.md 2), from `GET /lr/v1/admin/download_target`.
+struct ModelPlacesInfo: Equatable, Sendable {
+    struct Folder: Equatable, Identifiable, Sendable {
+        /// `askantis` or `huggingface`.
+        let place: String
+        let path: String
+        /// ok, missing_volume, not_allowed, unwritable or checking.
+        let state: String
+        let bytes: Int64
+        let models: Int
+        var id: String { place }
+
+        var title: String { place == "askantis" ? "Askantis folder" : "Hugging Face folder" }
+    }
+
+    /// `askantis`, `huggingface` or `custom`.
+    let target: String
+    let path: String
+    let customPath: String?
+    let hasHuggingface: Bool
+    let folders: [Folder]
+
+    init?(_ json: [String: Any]) {
+        guard let target = json["target"] as? String, let path = json["path"] as? String else { return nil }
+        self.target = target
+        self.path = path
+        customPath = json["custom_path"] as? String
+        hasHuggingface = json["has_huggingface"] as? Bool ?? false
+        folders = (json["folders"] as? [[String: Any]] ?? []).compactMap { f in
+            guard let place = f["place"] as? String, let path = f["path"] as? String else { return nil }
+            return Folder(place: place, path: path, state: f["state"] as? String ?? "checking",
+                          bytes: (f["bytes"] as? NSNumber)?.int64Value ?? 0, models: f["models"] as? Int ?? 0)
+        }
+    }
+}
+
 /// A model in the service's inventory (PROTOCOL.md 7.1), for choosing a role's model.
 struct InventoryModel: Identifiable, Hashable, Sendable {
     let id: String
@@ -458,6 +494,35 @@ final class DaemonStore {
         hfCacheState = state
     }
 
+    /// The `hf` store's two folders, what they hold, and where new models go
+    /// (PROTOCOL.md 2). Loaded when the Storage settings show them.
+    private(set) var modelPlaces: ModelPlacesInfo?
+    /// Progress of moving speech models between the two folders.
+    var placesMove: ModelStore.FolderChangeState = .idle
+
+    func loadModelPlaces() async {
+        let resp = try? await background { try UnixHTTP.request("GET", "/lr/v1/admin/download_target") }
+        guard let resp, resp.status == 200, let obj = resp.json as? [String: Any] else { return }
+        modelPlaces = ModelPlacesInfo(obj)
+    }
+
+    /// Where new speech models go: `askantis`, `huggingface`, or `custom` with a folder.
+    /// Models already downloaded stay where they are and are still found.
+    func setDownloadTarget(_ place: String, path: String? = nil) async {
+        let resp = try? await background {
+            var body: [String: Any] = ["target": place]
+            if let path { body["path"] = path }
+            return try UnixHTTP.request("PUT", "/lr/v1/admin/download_target", json: body)
+        }
+        if let resp, resp.status == 200, let obj = resp.json as? [String: Any] {
+            modelPlaces = ModelPlacesInfo(obj)
+            placesMove = .idle
+        } else {
+            placesMove = .failed("Local Router's service didn't take the change. Is it running?")
+        }
+        await refresh()
+    }
+
     /// "Check Again" after allowing the drive: the service looks right away.
     func checkDriveAgain() async {
         _ = try? await background { try UnixHTTP.request("POST", "/lr/v1/admin/hf_cache/check") }
@@ -503,8 +568,11 @@ final class DaemonStore {
             requests.removeAll()
             ApprovalPanel.shared.close()
             Task { await refresh() }
-        case "hf_cache.state":
-            Task { await refresh() }
+        case "hf_cache.state", "askantis_models.state", "download_target":
+            Task {
+                await refresh()
+                if modelPlaces != nil { await loadModelPlaces() }
+            }
         default:
             break
         }

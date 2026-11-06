@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use localrouter_hf::{Cache, CacheLocation, CacheState};
+use localrouter_hf::{Cache, CacheLocation, CacheState, ModelPlaces, Place, Setup};
 use localrouter_speech::{Aheads, Asr, AsrOptions, Diarizer, Strategy, catalog};
 
 #[derive(Parser)]
@@ -19,13 +19,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Where the Hugging Face cache is, and which speech models are in it.
+    /// Where models are (the Askantis models folder and the Hugging Face
+    /// cache), which speech models are there, and where new ones go.
     Models,
-    /// Download the speech models into the Hugging Face cache.
+    /// Download the speech models into the folder for new models, unless
+    /// they're already in one of the folders.
     Fetch {
         /// Whisper model id (see `lr models`).
         #[arg(long, default_value = catalog::WHISPER_TURBO_Q8.id)]
         whisper: String,
+        /// Where to put them: `askantis`, `huggingface` or a folder. Default:
+        /// what Local Router uses, else the Hugging Face cache if this
+        /// computer uses Hugging Face, else the Askantis folder.
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Who speaks when, as JSON turns.
     Diarize {
@@ -62,7 +69,7 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Models => models(),
-        Command::Fetch { whisper } => fetch(&whisper),
+        Command::Fetch { whisper, to } => fetch(&whisper, to.as_deref()),
         Command::Diarize { file, json } => diarize(file, json),
         Command::Transcribe { file, language, whisper, aheads, no_diarize, per_turn, json } => {
             transcribe(file, language, whisper, aheads, no_diarize, per_turn, json)
@@ -70,32 +77,104 @@ fn main() -> Result<()> {
     }
 }
 
-fn cache() -> Result<Cache> {
-    let loc = CacheLocation::resolve();
-    match loc.state {
-        CacheState::Ok => Ok(Cache::new(loc.hub)),
-        CacheState::MissingVolume => bail!("the Hugging Face cache {} is on a drive that isn't connected", loc.hub.display()),
-        CacheState::NotAllowed => bail!("macOS doesn't allow access to the Hugging Face cache {} (Privacy & Security → Files & Folders)", loc.hub.display()),
-        CacheState::Unwritable => bail!("the Hugging Face cache {} can't be written", loc.hub.display()),
+/// The model folders and where new models go.
+struct Places {
+    places: ModelPlaces,
+    target: (Place, PathBuf),
+}
+
+impl Places {
+    /// The target: `--to`, else what Local Router's service uses (its
+    /// discovery file), else the rule for tinkerers (PROTOCOL.md 2).
+    fn resolve(to: Option<&str>) -> Places {
+        let places = ModelPlaces::resolve();
+        let target = match to {
+            Some(to) => match Place::parse(to) {
+                Some(p) => (p, places.path(p, "")),
+                None => (Place::Custom, PathBuf::from(to)),
+            },
+            None => match localrouter_core::Endpoint::read(&localrouter_core::endpoint_path()) {
+                Ok(ep) if ep.download_target.is_some() => {
+                    let place = ep.download_target.as_deref().and_then(Place::parse).unwrap_or(Place::Askantis);
+                    let path = ep.download_path.map(PathBuf::from).unwrap_or_else(|| places.path(place, ""));
+                    (place, path)
+                }
+                _ => {
+                    let place = places.default_place(Setup::Tinker);
+                    (place, places.path(place, ""))
+                }
+            },
+        };
+        Places { places, target }
+    }
+
+    fn place_of(&self, path: &std::path::Path) -> Place {
+        if path == self.places.askantis {
+            Place::Askantis
+        } else if path == self.places.huggingface {
+            Place::Huggingface
+        } else {
+            Place::Custom
+        }
+    }
+
+    /// Folders that can be read now, target first.
+    fn usable(&self) -> Vec<(Place, Cache)> {
+        self.places
+            .roots(&self.target.1)
+            .into_iter()
+            .filter(|p| CacheLocation::check(p) == CacheState::Ok)
+            .map(|p| (self.place_of(&p), Cache::new(p)))
+            .collect()
+    }
+
+    /// The folder for new models, if it can be used.
+    fn target_cache(&self) -> Result<Cache> {
+        let path = &self.target.1;
+        match CacheLocation::check(path) {
+            CacheState::Ok => Ok(Cache::new(path)),
+            CacheState::MissingVolume => bail!("{} is on a drive that isn't connected", path.display()),
+            CacheState::NotAllowed => bail!("macOS doesn't allow access to {} (Privacy & Security → Files & Folders)", path.display()),
+            CacheState::Unwritable => bail!("{} can't be written", path.display()),
+        }
     }
 }
 
-fn models() -> Result<()> {
-    let loc = CacheLocation::resolve();
-    println!("Hugging Face cache: {} ({:?})", loc.hub.display(), loc.state);
-    let cache = Cache::new(&loc.hub);
-    for m in catalog::LISTED_WHISPER_MODELS {
-        let state = match catalog::whisper_present(&cache, *m)? {
-            Some(p) => format!("present  {}", p.display()),
-            None => format!("missing  ~{} MB", m.approx_bytes / 1_000_000),
-        };
-        println!("  {:<32} {state}", m.id);
+/// The first folder that has a Whisper model.
+fn find_whisper(roots: &[(Place, Cache)], m: catalog::WhisperModel) -> Result<Option<(Place, PathBuf)>> {
+    for (place, cache) in roots {
+        if let Some(p) = catalog::whisper_present(cache, m)? {
+            return Ok(Some((*place, p)));
+        }
     }
-    let speakers = match catalog::speaker_models_present(&cache)? {
-        Some(p) => format!("present  {}", p.display()),
-        None => "missing".into(),
+    Ok(None)
+}
+
+/// The first folder that has every speaker model.
+fn find_speakers(roots: &[(Place, Cache)]) -> Result<Option<(Place, PathBuf)>> {
+    for (place, cache) in roots {
+        if let Some(p) = catalog::speaker_models_present(cache)? {
+            return Ok(Some((*place, p)));
+        }
+    }
+    Ok(None)
+}
+
+fn models() -> Result<()> {
+    let p = Places::resolve(None);
+    let state = |path: &std::path::Path| CacheLocation::check(path).as_str();
+    println!("Askantis models folder: {} ({})", p.places.askantis.display(), state(&p.places.askantis));
+    println!("Hugging Face cache:     {} ({})", p.places.huggingface.display(), state(&p.places.huggingface));
+    println!("New models go to:       {} ({})", p.target.0.as_str(), p.target.1.display());
+    let roots = p.usable();
+    let line = |found: Option<(Place, PathBuf)>, missing: String| match found {
+        Some((place, path)) => format!("present  {:<11}  {}", place.as_str(), path.display()),
+        None => missing,
     };
-    println!("  {:<32} {speakers}", "speaker-diarization");
+    for m in catalog::LISTED_WHISPER_MODELS {
+        println!("  {:<32} {}", m.id, line(find_whisper(&roots, *m)?, format!("missing  ~{} MB", m.approx_bytes / 1_000_000)));
+    }
+    println!("  {:<32} {}", "speaker-diarization", line(find_speakers(&roots)?, "missing".into()));
     Ok(())
 }
 
@@ -108,25 +187,48 @@ fn progress_line(label: &str, done: u64, total: Option<u64>) {
     let _ = std::io::stderr().flush();
 }
 
-fn fetch(whisper: &str) -> Result<()> {
-    let cache = cache()?;
+fn fetch(whisper: &str, to: Option<&str>) -> Result<()> {
+    let p = Places::resolve(to);
     let model = catalog::LISTED_WHISPER_MODELS
         .iter()
         .copied()
         .find(|m| m.id == whisper)
         .with_context(|| format!("unknown Whisper model {whisper} (choose one of `lr models`)"))?;
-    let path = catalog::ensure_whisper(&cache, model, &mut |d, t| progress_line(model.file, d, t))?;
+    let roots = p.usable();
+    let found_whisper = find_whisper(&roots, model)?;
+    let found_speakers = find_speakers(&roots)?;
+    let target = if found_whisper.is_none() || found_speakers.is_none() {
+        if p.target.0 == Place::Askantis {
+            p.places.prepare_askantis().with_context(|| format!("creating {}", p.places.askantis.display()))?;
+        }
+        Some(p.target_cache()?)
+    } else {
+        None
+    };
+    let path = match (found_whisper, &target) {
+        (Some((_, path)), _) => path,
+        (None, Some(cache)) => catalog::ensure_whisper(cache, model, &mut |d, t| progress_line(model.file, d, t))?,
+        (None, None) => unreachable!(),
+    };
     eprintln!("\n{}", path.display());
-    let dir = catalog::ensure_speaker_models(&cache, &mut |f, d, t| progress_line(f, d, t))?;
+    let dir = match (found_speakers, &target) {
+        (Some((_, dir)), _) => dir,
+        (None, Some(cache)) => catalog::ensure_speaker_models(cache, &mut |f, d, t| progress_line(f, d, t))?,
+        (None, None) => unreachable!(),
+    };
     eprintln!("\n{}", dir.display());
     Ok(())
 }
 
+/// Every folder with models, for reading.
+fn roots() -> Vec<(Place, Cache)> {
+    Places::resolve(None).usable()
+}
+
 fn diarize(file: PathBuf, json: Option<PathBuf>) -> Result<()> {
     let t0 = Instant::now();
-    let cache = cache()?;
-    let dir = catalog::speaker_models_present(&cache)?
-        .context("the speaker models aren't downloaded yet; run `lr fetch`")?;
+    let roots = roots();
+    let (_, dir) = find_speakers(&roots)?.context("the speaker models aren't downloaded yet; run `lr fetch`")?;
     let audio = localrouter_audio::decode_file(&file)?;
     let mut diarizer = Diarizer::load(&dir)?;
     let t_load = t0.elapsed();
@@ -169,10 +271,11 @@ fn transcribe(
     json: Option<PathBuf>,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let cache = cache()?;
+    let roots = roots();
     let model_path = match catalog::whisper_model(&whisper) {
-        Some(m) => catalog::whisper_present(&cache, m)?
-            .with_context(|| format!("{} isn't downloaded yet; run `lr fetch --whisper {}`", m.id, m.id))?,
+        Some(m) => find_whisper(&roots, m)?
+            .with_context(|| format!("{} isn't downloaded yet; run `lr fetch --whisper {}`", m.id, m.id))?
+            .1,
         None => PathBuf::from(&whisper),
     };
     let aheads = match aheads {
@@ -185,8 +288,7 @@ fn transcribe(
     let mut diarizer = if no_diarize {
         None
     } else {
-        let dir = catalog::speaker_models_present(&cache)?
-            .context("the speaker models aren't downloaded yet; run `lr fetch`")?;
+        let (_, dir) = find_speakers(&roots)?.context("the speaker models aren't downloaded yet; run `lr fetch`")?;
         Some(Diarizer::load(&dir)?)
     };
     let t_load = t0.elapsed();

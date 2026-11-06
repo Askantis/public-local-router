@@ -186,7 +186,9 @@ async fn start_with(prepare: impl FnOnce(&Path), real_cache: bool) -> Daemon {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_localrouterd"));
     cmd.env("LR_SUPPORT_DIR", dir.path())
         .env("LR_PORT", port.to_string())
-        .env("LR_OLLAMA_URL", format!("http://127.0.0.1:{ollama}"));
+        .env("LR_OLLAMA_URL", format!("http://127.0.0.1:{ollama}"))
+        // Never the real Askantis models folder.
+        .env("ASKANTIS_MODELS", dir.path().join("askantis"));
     if !real_cache {
         cmd.env("HF_HUB_CACHE", dir.path().join("hub")); // an empty cache: no speech models
     }

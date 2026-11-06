@@ -4,15 +4,22 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use localrouter_hf::Cache;
+use localrouter_hf::{Cache, Place};
 
 use localrouter_speech::{Asr, AsrOptions, Audio, Diarizer, Strategy, Turn, catalog};
 use serde_json::{Value, json};
 
+/// A speech model on disk: id, capability, display name, bytes, and the
+/// folder it was found in.
+pub type Installed = (String, localrouter_core::Capability, String, u64, Place);
+
 pub struct Speech {
-    /// Set once the Hugging Face cache has been checked (that can wait for the
-    /// user to allow access to a removable drive).
-    cache: std::sync::RwLock<Option<Cache>>,
+    /// The model folders that can be used, where new models go first; set
+    /// once they have been checked (that can wait for the user to allow
+    /// access to a removable drive).
+    roots: std::sync::RwLock<Vec<(Place, Cache)>>,
+    /// Where new models go, when that folder can be used.
+    target: std::sync::RwLock<Option<(Place, Cache)>>,
     asr: Mutex<Option<(String, Arc<Asr>)>>,
     diarizer: Mutex<Option<Diarizer>>,
     /// One job at a time: the GPU and memory are shared.
@@ -21,32 +28,55 @@ pub struct Speech {
 
 impl Speech {
     pub fn new() -> Self {
-        Speech { cache: std::sync::RwLock::new(None), asr: Mutex::new(None), diarizer: Mutex::new(None), job: tokio::sync::Mutex::new(()) }
+        Speech { roots: Default::default(), target: Default::default(), asr: Mutex::new(None), diarizer: Mutex::new(None), job: tokio::sync::Mutex::new(()) }
     }
 
-    pub fn set_cache(&self, cache: Option<Cache>) {
-        *self.cache.write().unwrap() = cache;
+    pub fn set_roots(&self, roots: Vec<(Place, Cache)>, target: Option<(Place, Cache)>) {
+        *self.roots.write().unwrap() = roots;
+        *self.target.write().unwrap() = target;
     }
 
-    pub fn cache(&self) -> Option<Cache> {
-        self.cache.read().unwrap().clone()
+    /// The folders models are found in, the target first.
+    pub fn roots(&self) -> Vec<(Place, Cache)> {
+        self.roots.read().unwrap().clone()
     }
 
-    /// Speech models present in the cache: `(model id, capability, display name, bytes)`.
-    pub fn installed(&self) -> Vec<(String, localrouter_core::Capability, String, u64)> {
-        let Some(cache) = self.cache() else { return vec![] };
-        let cache = &cache;
-        let mut out = Vec::new();
-        for m in catalog::WHISPER_MODELS {
-            if let Ok(Some(path)) = catalog::whisper_present(cache, *m) {
-                let size = std::fs::metadata(&path).map(|md| md.len()).unwrap_or(m.approx_bytes);
-                out.push((catalog::whisper_model_id(m), localrouter_core::Capability::Transcription, m.display_name.to_string(), size));
+    /// Where new models go, if that folder can be used now.
+    pub fn target(&self) -> Option<(Place, Cache)> {
+        self.target.read().unwrap().clone()
+    }
+
+    /// Speech models on disk, each once: from the target if it's there, else
+    /// from the other folder.
+    pub fn installed(&self) -> Vec<Installed> {
+        let mut out: Vec<Installed> = Vec::new();
+        for (place, cache) in self.roots() {
+            for m in catalog::WHISPER_MODELS {
+                let id = catalog::whisper_model_id(m);
+                if out.iter().any(|i| i.0 == id) {
+                    continue;
+                }
+                if let Ok(Some(path)) = catalog::whisper_present(&cache, *m) {
+                    let size = std::fs::metadata(&path).map(|md| md.len()).unwrap_or(m.approx_bytes);
+                    out.push((id, localrouter_core::Capability::Transcription, m.display_name.to_string(), size, place));
+                }
+            }
+            let id = catalog::speaker_model_id();
+            if !out.iter().any(|i| i.0 == id)
+                && let Ok(Some(_)) = catalog::speaker_models_present(&cache)
+            {
+                out.push((id, localrouter_core::Capability::Diarization, "Speaker diarization (pyannote community-1)".into(), 183_000_000, place));
             }
         }
-        if let Ok(Some(_)) = catalog::speaker_models_present(cache) {
-            out.push((catalog::speaker_model_id(), localrouter_core::Capability::Diarization, "Speaker diarization (pyannote community-1)".into(), 183_000_000));
-        }
         out
+    }
+
+    fn whisper_path(&self, model: catalog::WhisperModel) -> Option<std::path::PathBuf> {
+        self.roots().iter().find_map(|(_, c)| catalog::whisper_present(c, model).ok().flatten())
+    }
+
+    fn speaker_dir(&self) -> Option<std::path::PathBuf> {
+        self.roots().iter().find_map(|(_, c)| catalog::speaker_models_present(c).ok().flatten())
     }
 
     fn asr_for(&self, model_id: &str) -> Result<Arc<Asr>> {
@@ -55,9 +85,8 @@ impl Speech {
             && id == model_id {
                 return Ok(asr.clone());
             }
-        let cache = self.cache().context("the Hugging Face cache isn't available")?;
         let model = catalog::whisper_by_model_id(model_id).context("not a speech model Local Router knows")?;
-        let path = catalog::whisper_present(&cache, model)?.context("model isn't downloaded")?;
+        let path = self.whisper_path(model).context("model isn't downloaded")?;
         // Free the old model before loading the new one.
         *slot = None;
         let asr = Arc::new(Asr::load(&path, catalog::aheads_for(&model))?);
@@ -68,8 +97,7 @@ impl Speech {
     fn with_diarizer<T>(&self, f: impl FnOnce(&mut Diarizer) -> Result<T>) -> Result<T> {
         let mut slot = self.diarizer.lock().unwrap();
         if slot.is_none() {
-            let cache = self.cache().context("the Hugging Face cache isn't available")?;
-            let dir = catalog::speaker_models_present(&cache)?.context("speaker models aren't downloaded")?;
+            let dir = self.speaker_dir().context("speaker models aren't downloaded")?;
             *slot = Some(Diarizer::load(&dir)?);
         }
         f(slot.as_mut().unwrap())

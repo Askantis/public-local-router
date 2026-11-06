@@ -1270,6 +1270,9 @@ mod tests {
             http: "http://127.0.0.1:11436".into(),
             socket: Some(dir.path().join("lr.sock").display().to_string()),
             hf_cache: localrouter_core::HfCacheInfo { path: None, state: "ok".into() },
+            askantis_models: None,
+            download_target: None,
+            download_path: None,
             ollama: localrouter_core::OllamaInfo { url: String::new(), state: "stopped".into(), version: None },
             capabilities: vec![],
         };

@@ -13,5 +13,6 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 localrouter-hf.workspace = true
+localrouter-core.workspace = true
 localrouter-audio.workspace = true
 localrouter-speech.workspace = true

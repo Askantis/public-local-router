@@ -111,6 +111,65 @@ enum ModelFolderMover {
         try fileManager.createSymbolicLink(at: link, withDestinationURL: destination)
     }
 
+    // MARK: - Speech models (the Hugging Face layout)
+
+    /// Model repositories (`models--<org>--<repo>`) in a Hugging Face–layout folder.
+    static func hfRepositories(in folder: URL) -> [URL] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        return names.filter { $0.hasPrefix("models--") }.sorted().map { folder.appending(path: $0) }
+    }
+
+    /// A download is still writing into it (`blobs/*.incomplete`).
+    static func isDownloading(_ repository: URL) -> Bool {
+        let blobs = (try? FileManager.default.contentsOfDirectory(atPath: repository.appending(path: "blobs").path)) ?? []
+        return blobs.contains { $0.hasSuffix(".incomplete") }
+    }
+
+    /// Moves model repositories between the Askantis models folder and the
+    /// Hugging Face cache, which share one layout. Each repository moves as a
+    /// whole, so its relative links (snapshots → blobs) keep working. On the
+    /// same drive that's a rename; across drives it's copied under a temporary
+    /// name, checked, renamed into place, and only then deleted at the source.
+    /// Repositories already in `destination`, or still downloading, stay where they are.
+    static func moveHFModels(from source: URL, to destination: URL, progress: @Sendable (Double) -> Void) throws -> (moved: Int, kept: Int) {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        let repositories = hfRepositories(in: source)
+        let sameDrive = sameVolume(source, destination)
+        let total = max(1, repositories.reduce(Int64(0)) { $0 + size(of: $1) })
+        var done: Int64 = 0
+        var moved = 0, kept = 0
+
+        for repository in repositories {
+            let bytes = size(of: repository)
+            defer {
+                done += bytes
+                progress(Double(done) / Double(total))
+            }
+            let target = destination.appending(path: repository.lastPathComponent)
+            if fileManager.fileExists(atPath: target.path) || isDownloading(repository) {
+                kept += 1
+                continue
+            }
+            if sameDrive {
+                try fileManager.moveItem(at: repository, to: target)
+            } else {
+                let partial = destination.appending(path: "." + repository.lastPathComponent + ".partial")
+                if fileManager.fileExists(atPath: partial.path) { try fileManager.removeItem(at: partial) }
+                try fileManager.copyItem(at: repository, to: partial)  // links are copied as links
+                guard size(of: partial) == bytes else {
+                    try? fileManager.removeItem(at: partial)
+                    throw MoveError(message: "Copy check failed for \(repository.lastPathComponent). Nothing was deleted.")
+                }
+                try fileManager.moveItem(at: partial, to: target)
+                try fileManager.removeItem(at: repository)
+            }
+            moved += 1
+        }
+        progress(1)
+        return (moved, kept)
+    }
+
     // MARK: - Helpers
 
     /// Moves a folder into place, merging file by file when the target exists.

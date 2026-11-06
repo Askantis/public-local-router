@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use localrouter_core::ApiError;
-use localrouter_hf::{Cache, MirrorFile};
+use localrouter_hf::{Cache, MirrorFile, Place};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -302,20 +302,43 @@ pub async fn run(job: Arc<Job>, plan: Plan, st: crate::app::Shared) {
             let r = st.ollama.pull(&name, move |done, total| j.update(&s.events, done, total), &job.cancel).await;
             r.map_err(|e| ApiError::upstream_unavailable(e.to_string()))
         }
-        plan => match st.speech.cache() {
-            None => Err(ApiError::new(503, "server_error", "internal", "The Hugging Face cache isn't available.")),
-            Some(cache) => {
+        plan => match st.speech.target() {
+            None => Err(no_target()),
+            Some(target) => {
                 let (j, s) = (job.clone(), st.clone());
-                tokio::task::spawn_blocking(move || hf_download(&cache, plan, &j, &s.events))
-                    .await
-                    .unwrap_or_else(|e| Err(ApiError::internal(e.to_string())))
+                let roots = st.speech.roots();
+                tokio::task::spawn_blocking(move || {
+                    let (place, cache) = where_to(target, &roots, &plan);
+                    crate::places::prepare(&s.places, place)?;
+                    let others: Vec<Cache> = roots.into_iter().map(|(_, c)| c).filter(|c| c.hub() != cache.hub()).collect();
+                    hf_download(&cache, &others, plan, &j, &s.events)
+                })
+                .await
+                .unwrap_or_else(|e| Err(ApiError::internal(e.to_string())))
             }
         },
     };
     job.finish(&st.events, result);
 }
 
-fn hf_download(cache: &Cache, plan: Plan, job: &Job, events: &Events) -> Result<(), ApiError> {
+/// The folder for new models isn't usable (drive not connected, not allowed).
+pub fn no_target() -> ApiError {
+    ApiError::new(503, "server_error", "internal", "The folder for new models isn't available. Check Local Router's Storage settings.")
+}
+
+/// Where a download goes: the target, except that a mirror completes a
+/// repository where it already is (its checks are about the files there).
+fn where_to(target: (Place, Cache), roots: &[(Place, Cache)], plan: &Plan) -> (Place, Cache) {
+    if let Plan::Mirror { repo, .. } = plan
+        && let Some(found) = roots.iter().find(|(_, c)| c.repo_dir(repo).is_ok_and(|d| d.is_dir()))
+    {
+        return found.clone();
+    }
+    target
+}
+
+/// Download into `cache`; files already in one of the `others` folders are skipped.
+fn hf_download(cache: &Cache, others: &[Cache], plan: Plan, job: &Job, events: &Events) -> Result<(), ApiError> {
     let mut progress = |done: u64, total: Option<u64>| job.update(events, done, total);
     match plan {
         Plan::HfFile { repo, file, revision, token } => {
@@ -325,14 +348,17 @@ fn hf_download(cache: &Cache, plan: Plan, job: &Job, events: &Events) -> Result<
         Plan::HfRepo { repo, revision, token } => {
             let cache = cache.clone().with_token(token);
             let (commit, files) = cache.list_files(&repo, &revision).map_err(hf_error)?;
+            let elsewhere = |f: &String| others.iter().any(|c| c.snapshot_path(&repo, f, &commit).ok().flatten().is_some());
+            let wanted: Vec<&String> = files.iter().filter(|f| !elsewhere(f)).collect();
             // Bytes aren't known up front for a whole repository: count files.
             let n = files.len() as u64;
-            for (i, file) in files.iter().enumerate() {
+            let skipped = n - wanted.len() as u64;
+            for (i, file) in wanted.iter().enumerate() {
                 let mut ignore = |_: u64, _: Option<u64>| {};
                 // By branch, so refs/<branch> is written; pinned to the commit we listed.
-                let rev = if i + 1 == files.len() { revision.as_str() } else { commit.as_str() };
+                let rev = if i + 1 == wanted.len() { revision.as_str() } else { commit.as_str() };
                 cache.download_cancellable(&repo, file, rev, &mut ignore, &job.cancel).map_err(hf_error)?;
-                job.update(events, i as u64 + 1, Some(n));
+                job.update(events, skipped + i as u64 + 1, Some(n));
             }
             Ok(())
         }

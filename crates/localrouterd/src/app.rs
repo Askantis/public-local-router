@@ -48,8 +48,12 @@ pub struct AppState {
     pub events: Events,
     pub ollama: Ollama,
     pub speech: Arc<Speech>,
+    /// Where `hf` models are found and go (PROTOCOL.md 2).
+    pub places: localrouter_hf::ModelPlaces,
     pub hf: RwLock<HfCacheInfo>,
-    /// Wakes the Hugging Face cache check (`POST /lr/v1/admin/hf_cache/check`).
+    /// The Askantis models folder, as last checked.
+    pub askantis: RwLock<HfCacheInfo>,
+    /// Wakes the model-folder check (`POST /lr/v1/admin/hf_cache/check`).
     pub hf_check: tokio::sync::Notify,
     pub ollama_state: RwLock<OllamaInfo>,
     /// Models apps run themselves: approval key → (models, lease end).
@@ -212,6 +216,8 @@ pub fn router(st: Shared, transport: Transport) -> Router {
         .route("/lr/v1/admin/keys/{id}", delete(admin_revoke_key))
         .route("/lr/v1/admin/shutdown", post(admin_shutdown))
         .route("/lr/v1/admin/hf_cache/check", post(admin_check_hf_cache))
+        .route("/lr/v1/admin/download_target", get(admin_download_target).put(admin_set_download_target))
+        .route("/lr/v1/admin/models/{*id}", delete(admin_delete_model))
         .layer(DefaultBodyLimit::max(4 << 20))
         .layer(middleware::from_fn(request_id))
         .layer(Extension(transport))
@@ -269,15 +275,15 @@ async fn health(State(st): State<Shared>) -> Json<Health> {
         capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
         ollama: st.ollama_state.read().unwrap().clone(),
         hf_cache: st.hf.read().unwrap().clone(),
+        askantis_models: Some(st.askantis.read().unwrap().clone()),
+        download_target: Some(crate::places::target(&st).0.as_str().into()),
+        download_path: Some(crate::places::target(&st).1.display().to_string()),
     })
 }
 
 /// Speech models in the cache. Reading the disk can block (a removable drive
 /// waiting for the user's permission), so it never runs on an async thread.
-async fn installed_speech(st: &AppState) -> Vec<(String, Capability, String, u64)> {
-    if st.hf.read().unwrap().state != "ok" {
-        return vec![];
-    }
+async fn installed_speech(st: &AppState) -> Vec<speech::Installed> {
     let speech = st.speech_handle();
     tokio::task::spawn_blocking(move || speech.installed()).await.unwrap_or_default()
 }
@@ -285,7 +291,7 @@ async fn installed_speech(st: &AppState) -> Vec<(String, Capability, String, u64
 struct Inventory {
     ollama: Vec<ollama::OllamaModel>,
     loaded: Vec<ollama::Loaded>,
-    speech: Vec<(String, Capability, String, u64)>,
+    speech: Vec<speech::Installed>,
 }
 
 impl Inventory {
@@ -301,7 +307,7 @@ impl Inventory {
             .iter()
             .map(|m| Candidate { id: m.name.clone(), capabilities: m.protocol_capabilities(), context_length: m.context_length })
             .collect();
-        c.extend(self.speech.iter().map(|(id, cap, _, _)| Candidate { id: id.clone(), capabilities: vec![*cap], context_length: None }));
+        c.extend(self.speech.iter().map(|(id, cap, ..)| Candidate { id: id.clone(), capabilities: vec![*cap], context_length: None }));
         c
     }
 }
@@ -368,10 +374,10 @@ async fn models(State(st): State<Shared>, caller: Caller, Query(f): Query<ModelF
         }
         out.push(v);
     }
-    for (id, cap, name, size) in &inv.speech {
+    for (id, cap, name, size, place) in &inv.speech {
         let kind = if *cap == Capability::Transcription { "asr" } else { "diarization" };
         out.push(json!({
-            "id": id, "store": "hf", "kind": kind, "display_name": name,
+            "id": id, "store": "hf", "place": place.as_str(), "kind": kind, "display_name": name,
             "format": if kind == "asr" { "ggml" } else { "other" }, "size_bytes": size,
             "capabilities": [serde_json::to_value(cap).unwrap()],
             "state": if speech_loaded.contains(id) { "loaded" } else { "available" },
@@ -820,14 +826,15 @@ async fn already_present(st: &AppState, plan: &Plan) -> bool {
             let want = if name.contains(':') { name.clone() } else { format!("{name}:latest") };
             st.ollama.models().await.is_ok_and(|ms| ms.iter().any(|m| m.name == want))
         }
+        // In either folder (PROTOCOL.md 2: never a second copy).
         Plan::HfFile { repo, file, revision, .. } => {
-            let Some(cache) = st.speech.cache() else { return false };
+            let roots = st.speech.roots();
             let (repo, file, revision) = (repo.clone(), file.clone(), revision.clone());
-            tokio::task::spawn_blocking(move || cache.snapshot_path(&repo, &file, &revision).ok().flatten().is_some())
+            tokio::task::spawn_blocking(move || roots.iter().any(|(_, c)| c.snapshot_path(&repo, &file, &revision).ok().flatten().is_some()))
                 .await
                 .unwrap_or(false)
         }
-        // Present files are skipped without going online.
+        // Present files (in either folder) are skipped without going online.
         Plan::HfRepo { .. } | Plan::Mirror { .. } => false,
     }
 }
@@ -857,7 +864,7 @@ async fn start_download(State(st): State<Shared>, caller: Caller, Json(req): Jso
     let key = download_key(&st, &caller)?;
     let plan = plan_for(&caller, req)?;
     if let Plan::Mirror { files, .. } = &plan {
-        let cache = st.speech.cache().ok_or_else(|| ApiError::new(503, "server_error", "internal", "The Hugging Face cache isn't available."))?;
+        let cache = st.speech.target().map(|(_, c)| c).ok_or_else(downloads::no_target)?;
         #[cfg(feature = "test-admin")]
         let cache = cache.with_mirror_guard(localrouter_hf::MirrorGuard::AllowLoopbackForTests);
         cache.check_mirror_files(files).map_err(downloads::hf_error)?;
@@ -1394,6 +1401,119 @@ async fn admin_check_hf_cache(State(st): State<Shared>, caller: Caller) -> R<Sta
     admin(&caller)?;
     st.hf_check.notify_one();
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Both model folders, how much they hold, and where new models go.
+async fn admin_download_target(State(st): State<Shared>, caller: Caller) -> R<Json<Value>> {
+    admin(&caller)?;
+    Ok(Json(download_target_body(&st).await))
+}
+
+async fn download_target_body(st: &AppState) -> Value {
+    let (place, path) = crate::places::target(st);
+    let infos = [
+        ("askantis", st.places.askantis.clone(), st.askantis.read().unwrap().state.clone()),
+        ("huggingface", st.places.huggingface.clone(), st.hf.read().unwrap().state.clone()),
+    ];
+    let mut folders = Vec::new();
+    for (name, dir, state) in infos {
+        // Only folders already checked: reading one can wait on macOS asking.
+        let (bytes, models) = if state == "ok" {
+            let d = dir.clone();
+            tokio::task::spawn_blocking(move || folder_usage(&d)).await.unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        folders.push(json!({ "place": name, "path": dir.display().to_string(), "state": state, "bytes": bytes, "models": models }));
+    }
+    json!({
+        "target": place.as_str(),
+        "path": path.display().to_string(),
+        "custom_path": st.store.read().unwrap().settings.download_path,
+        "has_huggingface": st.places.has_huggingface(),
+        "folders": folders,
+    })
+}
+
+/// Bytes and `models--*` folders in a model folder.
+fn folder_usage(dir: &std::path::Path) -> (u64, usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+    let repos: Vec<_> = entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("models--")).collect();
+    (repos.iter().map(|e| localrouter_hf::dir_size(&e.path())).sum(), repos.len())
+}
+
+#[derive(Deserialize)]
+struct TargetBody {
+    target: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Choose where new models go. Models already downloaded stay where they
+/// are and are still found.
+async fn admin_set_download_target(State(st): State<Shared>, caller: Caller, Json(b): Json<TargetBody>) -> R<Json<Value>> {
+    admin(&caller)?;
+    let place = localrouter_hf::Place::parse(&b.target)
+        .ok_or_else(|| ApiError::invalid("target is askantis, huggingface or custom").with_param("target"))?;
+    let path = match place {
+        localrouter_hf::Place::Custom => {
+            let p = b.path.as_deref().map(str::trim).unwrap_or_default();
+            if !std::path::Path::new(p).is_absolute() {
+                return Err(ApiError::invalid("a custom folder needs an absolute path").with_param("path").into());
+            }
+            Some(p.to_string())
+        }
+        _ => None,
+    };
+    {
+        let mut store = st.store.write().unwrap();
+        store.settings.download_target = Some(place);
+        if path.is_some() {
+            store.settings.download_path = path;
+        }
+        let _ = store.save();
+    }
+    // Check the new folder, update the discovery file and tell everyone.
+    st.hf_check.notify_one();
+    Ok(Json(download_target_body(&st).await))
+}
+
+/// Remove an `hf` model from both folders, unless another Askantis app
+/// says it uses it (`<Askantis folder>/.apps/*.json`, PROTOCOL.md 2).
+async fn admin_delete_model(State(st): State<Shared>, caller: Caller, Path(id): Path<String>) -> R<StatusCode> {
+    admin(&caller)?;
+    let Some(rest) = id.strip_prefix("hf:") else {
+        return Err(ApiError::invalid("only hf: models are removed here; Ollama removes its own").with_param("id").into());
+    };
+    let repo: String = rest.split('@').next().unwrap_or_default().split('/').take(2).collect::<Vec<_>>().join("/");
+    if !localrouter_hf::is_valid_repo(&repo) {
+        return Err(ApiError::invalid("not a model id like hf:org/repo").with_param("id").into());
+    }
+    let in_use = st.speech.loaded().iter().any(|m| m.strip_prefix("hf:").is_some_and(|m| m == repo || m.starts_with(&format!("{repo}/"))));
+    if in_use {
+        return Err(ApiError::new(409, "invalid_request_error", "conflict", format!("{id} is loaded. Unload it first.")).into());
+    }
+    let (_, target) = crate::places::target(&st);
+    let places = st.places.clone();
+    let r = repo.clone();
+    let present = {
+        let (places, target, r) = (places.clone(), target.clone(), r.clone());
+        tokio::task::spawn_blocking(move || places.find_repo(&target, &r).is_some()).await.unwrap_or(false)
+    };
+    if !present {
+        return Err(ApiError::not_found(format!("{id} isn't downloaded")).into());
+    }
+    let removed = tokio::task::spawn_blocking(move || places.remove_if_unused(&target, BUNDLE_ID, &r))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| ApiError::internal(format!("Couldn't remove {id}: {e}")))?;
+    match removed {
+        Some(_) => {
+            st.events.send("model.removed", json!({ "id": format!("hf:{repo}") }), Audience::Everyone);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        None => Err(ApiError::new(409, "invalid_request_error", "conflict", format!("Another app uses {repo}, so it stays.")).into()),
+    }
 }
 
 async fn admin_shutdown(State(st): State<Shared>, caller: Caller) -> R<StatusCode> {

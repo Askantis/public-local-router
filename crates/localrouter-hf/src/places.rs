@@ -180,7 +180,7 @@ impl ModelPlaces {
             fs::read(e.path())
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Usage>(&b).ok())
-                .is_some_and(|u| u.app_id != app_id && u.models.iter().any(|m| *m == repo))
+                .is_some_and(|u| u.app_id != app_id && u.models.contains(&repo))
         })
     }
 
@@ -235,9 +235,14 @@ pub fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// `tmutil` can take several seconds, so it runs on its own thread and
+/// nothing waits for it.
 #[cfg(target_os = "macos")]
 fn exclude_from_backup(path: &Path) {
-    let _ = std::process::Command::new("/usr/bin/tmutil").arg("addexclusion").arg(path).output();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("/usr/bin/tmutil").arg("addexclusion").arg(path).output();
+    });
 }
 
 #[cfg(not(target_os = "macos"))]

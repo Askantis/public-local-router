@@ -53,7 +53,7 @@ Local Router answers those at a glance, from the menu bar, and leaves Ollama in 
 | **Share securely** | Let other devices use your models through Local Router, with an access key per device and HTTPS encryption. Ollama itself stays private. Works like any OpenAI-compatible provider: base URL plus API key. |
 | **Log Stream** | A terminal-style view of what Ollama is doing: requests and the app they came from (for example Hermes), each new prompt and how much came from the cache, prompt progress, generation speed and a summary per request. |
 | **Organise** | Short, readable names with the maker's logo (`glm-4.7-flash:latest` → *GLM 4.7 Flash*), your own names, tags (Coding, Researching, Talking, Working, Writing) and Favorites. |
-| **Models folder** | See where models live and how full the drive is, and move them to another folder or an external drive with a checked copy. |
+| **Models folder** | See where models live and how full the drive is, and move them to another folder or an external drive with a checked copy. Speech models for apps like Scribely live in the Askantis models folder or the Hugging Face cache: choose where new ones go and move them between the two. |
 | **Delete** | Remove models you don't use, with the space it frees shown before you confirm. |
 | **Onboarding** | Checks that Ollama is installed and running, sets up the models folder, and asks for the two optional permissions. |
 
@@ -150,6 +150,17 @@ On Apple silicon, MLX is Apple's own framework and usually the better fit, which
 <summary><b>Is moving the models folder safe?</b></summary>
 
 Across drives, Local Router copies every file, checks its size, and only then deletes the originals. A folder that still has content is renamed, never deleted. Ollama is stopped during the move and started again afterwards. If `OLLAMA_MODELS` is set, it overrides the folder, so Local Router tells you instead of moving anything.
+</details>
+
+<details>
+<summary><b>Where do speech models go?</b></summary>
+
+Models that Local Router's service runs itself (speech to text, speaker separation) are kept in one of two folders, in the same layout:
+
+- **The Askantis models folder**, `~/Library/Application Support/Askantis/Models`, shared by every Askantis app and left out of Time Machine backups, since everything in it can be downloaded again.
+- **The Hugging Face cache** (`~/.cache/huggingface/hub`, or wherever `HF_HUB_CACHE` or `HF_HOME` point), shared with Python tools, llama.cpp and other programs that use Hugging Face.
+
+Models are found in both, and nothing is downloaded twice. New ones go to the Hugging Face cache if your Mac already uses Hugging Face, otherwise to the Askantis folder. Change it under **Settings → Models Folder**, where you can also move models from one folder to the other. A model another Askantis app uses is never removed from there.
 </details>
 
 <details>
