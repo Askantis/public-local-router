@@ -19,6 +19,8 @@ use std::time::Duration;
 
 mod mirror;
 pub use mirror::{MirrorFile, MirrorGuard};
+mod places;
+pub use places::{dir_size, ModelPlaces, Place, Setup};
 
 use sha2::{Digest, Sha256};
 
@@ -92,7 +94,11 @@ impl CacheLocation {
     }
 
     fn path_with(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-        let home = home_dir();
+        Self::path_with_home(lookup, &home_dir())
+    }
+
+    pub(crate) fn path_with_home(lookup: &dyn Fn(&str) -> Option<String>, home: &Path) -> PathBuf {
+        let home = home.to_path_buf();
         if let Some(hub) = lookup("HF_HUB_CACHE") {
             expand(&hub, &home)
         } else if let Some(hf_home) = lookup("HF_HOME") {
@@ -105,11 +111,16 @@ impl CacheLocation {
     }
 }
 
-fn home_dir() -> PathBuf {
+/// A variable from the process environment, else (macOS) `launchctl getenv`.
+pub(crate) fn env_lookup(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty()).or_else(|| launchctl_getenv(name))
+}
+
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
-fn expand(path: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand(path: &str, home: &Path) -> PathBuf {
     let path = path.trim();
     match path.strip_prefix("~/") {
         Some(rest) => home.join(rest),

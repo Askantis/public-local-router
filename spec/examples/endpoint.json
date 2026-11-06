@@ -7,6 +7,9 @@
   "http": "http://127.0.0.1:11436",
   "socket": "/Users/me/Library/Application Support/Local Router/lr.sock",
   "hf_cache": { "path": "/Users/me/.cache/huggingface/hub", "state": "ok" },
+  "askantis_models": { "path": "/Users/me/Library/Application Support/Askantis/Models", "state": "ok" },
+  "download_target": "askantis",
+  "download_path": "/Users/me/Library/Application Support/Askantis/Models",
   "ollama": { "url": "http://127.0.0.1:11434", "state": "running", "version": "0.34.4" },
   "capabilities": ["connect", "roles", "resident", "downloads", "events", "audio.transcriptions",
                    "audio.diarizations", "chat", "embeddings", "ollama.passthrough"]

@@ -184,3 +184,29 @@ extension ModelStore {
         }
     }
 }
+
+extension DaemonStore {
+    /// Moves the speech models in `source` into `destination` (the other of
+    /// the two standard folders). Apps find them in either, so nothing stops.
+    func moveSpeechModels(from source: ModelPlacesInfo.Folder, to destination: ModelPlacesInfo.Folder) async {
+        let from = URL(fileURLWithPath: source.path)
+        let to = URL(fileURLWithPath: destination.path)
+        placesMove = .working(step: "Moving models…", fraction: 0)
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try ModelFolderMover.moveHFModels(from: from, to: to) { fraction in
+                    Task { @MainActor in DaemonStore.shared.placesMove = .working(step: "Moving models…", fraction: fraction) }
+                }
+            }.value
+            await loadModelPlaces()
+            var message = result.moved == 1 ? "Moved 1 model to the \(destination.title)." : "Moved \(result.moved) models to the \(destination.title)."
+            if result.kept > 0 {
+                message += " \(result.kept) stayed in the \(source.title): already there, or still downloading."
+            }
+            placesMove = .finished(message)
+        } catch {
+            await loadModelPlaces()
+            placesMove = .failed(error.localizedDescription)
+        }
+    }
+}

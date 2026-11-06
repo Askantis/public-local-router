@@ -16,6 +16,7 @@ mod downloads;
 mod events;
 mod holds;
 mod ollama;
+mod places;
 mod speech;
 mod state;
 
@@ -24,8 +25,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use localrouter_core::{Endpoint, HfCacheInfo, OllamaInfo, PROTOCOL, TCP_PORT, TCP_PORT_LAST};
-use localrouter_hf::{Cache, CacheLocation, CacheState};
+use localrouter_core::{Endpoint, OllamaInfo, PROTOCOL, TCP_PORT, TCP_PORT_LAST};
+use localrouter_hf::ModelPlaces;
 use tokio::net::{TcpListener, UnixListener};
 
 use crate::app::{AppState, Shared, SocketPeer, Transport};
@@ -47,17 +48,26 @@ async fn main() -> Result<()> {
     let (tcp4, port) = bind_tcp(first, last).await?;
     let tcp6 = TcpListener::bind(("::1", port)).await.ok();
 
-    // Only the path now: checking the drive can wait on a permission prompt.
-    let hub = CacheLocation::resolve_path();
+    // Only the paths now: checking a drive can wait on a permission prompt.
+    let model_places = ModelPlaces::resolve();
+    let mut store = state::Store::load();
+    if store.settings.download_target.is_none() {
+        // Decided once, so new models keep going to the same place.
+        store.settings.download_target = Some(places::initial_target(&model_places));
+        let _ = store.save();
+    }
+    let checking = |p: &std::path::Path| localrouter_core::HfCacheInfo { path: Some(p.display().to_string()), state: "checking".into() };
     let ollama_url = std::env::var("LR_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let st: Shared = Arc::new(AppState {
         instance_id: uuid::Uuid::new_v4().to_string(),
-        store: RwLock::new(state::Store::load()),
+        store: RwLock::new(store),
         pending: Mutex::new(state::PendingRequests::default()),
         events: events::Events::new(),
         ollama: ollama::Ollama::new(ollama_url.clone()),
         speech: Arc::new(speech::Speech::new()),
-        hf: RwLock::new(HfCacheInfo { path: Some(hub.display().to_string()), state: "checking".into() }),
+        hf: RwLock::new(checking(&model_places.huggingface)),
+        askantis: RwLock::new(checking(&model_places.askantis)),
+        places: model_places,
         hf_check: tokio::sync::Notify::new(),
         ollama_state: RwLock::new(OllamaInfo { url: ollama_url, state: "stopped".into(), version: None }),
         resident: Mutex::new(Default::default()),
@@ -78,7 +88,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { axum::serve(l6, tcp_app).await });
     }
 
-    let endpoint = Endpoint {
+    let mut endpoint = Endpoint {
         protocols: vec![PROTOCOL],
         daemon_version: env!("CARGO_PKG_VERSION").into(),
         instance_id: st.instance_id.clone(),
@@ -87,43 +97,19 @@ async fn main() -> Result<()> {
         http: format!("http://127.0.0.1:{port}"),
         socket: Some(socket_path.display().to_string()),
         hf_cache: st.hf.read().unwrap().clone(),
+        askantis_models: None,
+        download_target: None,
+        download_path: None,
         ollama: st.ollama_state.read().unwrap().clone(),
         capabilities: app::CAPABILITIES.iter().map(|s| s.to_string()).collect(),
     };
+    places::fill_endpoint(&st, &mut endpoint);
     let endpoint_path = localrouter_core::endpoint_path();
     endpoint.write_atomic(&endpoint_path)?;
     eprintln!("localrouterd {} ready: {} and {}", env!("CARGO_PKG_VERSION"), socket_path.display(), endpoint.http);
 
-    // Check the Hugging Face cache off the main path and announce the result;
-    // while it isn't usable (drive not connected, not allowed yet), check
-    // again every 15 s, and whenever the app asks.
-    tokio::spawn({
-        let st = st.clone();
-        let endpoint_path = endpoint_path.clone();
-        async move {
-            let mut last: Option<CacheState> = None;
-            loop {
-                let hub2 = hub.clone();
-                let state = tokio::task::spawn_blocking(move || CacheLocation::check(&hub2)).await.unwrap_or(CacheState::Unwritable);
-                if last != Some(state) {
-                    last = Some(state);
-                    st.speech.set_cache((state == CacheState::Ok).then(|| Cache::new(&hub)));
-                    let info = HfCacheInfo { path: Some(hub.display().to_string()), state: state.as_str().into() };
-                    *st.hf.write().unwrap() = info.clone();
-                    if let Ok(mut ep) = Endpoint::read(&endpoint_path) {
-                        ep.hf_cache = info.clone();
-                        let _ = ep.write_atomic(&endpoint_path);
-                    }
-                    st.events.send("hf_cache.state", serde_json::to_value(&info).unwrap(), Audience::Everyone);
-                }
-                if state == CacheState::Ok {
-                    st.hf_check.notified().await;
-                } else {
-                    let _ = tokio::time::timeout(Duration::from_secs(15), st.hf_check.notified()).await;
-                }
-            }
-        }
-    });
+    // Check the model folders off the main path and announce the result.
+    tokio::spawn(places::watch(st.clone(), endpoint_path.clone()));
 
     tokio::spawn({
         let st = st.clone();

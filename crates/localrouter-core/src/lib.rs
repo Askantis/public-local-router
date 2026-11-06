@@ -53,6 +53,16 @@ pub struct Endpoint {
     pub http: String,
     pub socket: Option<String>,
     pub hf_cache: HfCacheInfo,
+    /// The Askantis models folder, the `hf` store's second folder (PROTOCOL.md 2).
+    /// Missing in files written by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub askantis_models: Option<HfCacheInfo>,
+    /// Where new `hf` models go: `askantis`, `huggingface` or `custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_target: Option<String>,
+    /// The folder `download_target` stands for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_path: Option<String>,
     pub ollama: OllamaInfo,
     pub capabilities: Vec<String>,
 }
@@ -182,6 +192,12 @@ pub struct Health {
     pub capabilities: Vec<String>,
     pub ollama: OllamaInfo,
     pub hf_cache: HfCacheInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub askantis_models: Option<HfCacheInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -327,6 +343,9 @@ mod tests {
             http: "http://127.0.0.1:11436".into(),
             socket: Some("/tmp/lr.sock".into()),
             hf_cache: HfCacheInfo { path: Some("/x/hub".into()), state: "ok".into() },
+            askantis_models: Some(HfCacheInfo { path: Some("/x/Askantis/Models".into()), state: "ok".into() }),
+            download_target: Some("askantis".into()),
+            download_path: Some("/x/Askantis/Models".into()),
             ollama: OllamaInfo { url: "http://127.0.0.1:11434".into(), state: "running".into(), version: None },
             capabilities: vec!["connect".into()],
         };
@@ -334,6 +353,23 @@ mod tests {
         assert_eq!(Endpoint::read(&path).unwrap(), ep);
         let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
         assert_eq!(leftovers.len(), 1, "no temporary file left behind");
+    }
+
+    #[test]
+    fn older_discovery_files_still_read() {
+        // Written before the Askantis models folder existed.
+        let old = r#"{"protocols":[1],"daemon_version":"0.1.0","instance_id":"x","pid":1,"started_at":"t",
+            "http":"http://127.0.0.1:11436","socket":null,"hf_cache":{"path":"/x/hub","state":"ok"},
+            "ollama":{"url":"u","state":"stopped"},"capabilities":[]}"#;
+        let ep: Endpoint = serde_json::from_str(old).unwrap();
+        assert_eq!(ep.askantis_models, None);
+        assert_eq!(ep.download_target, None);
+        let health: Health = serde_json::from_str(
+            r#"{"protocols":[1],"daemon_version":"0.1.0","instance_id":"x","capabilities":[],
+                "ollama":{"url":"u","state":"stopped"},"hf_cache":{"path":null,"state":"ok"}}"#,
+        )
+        .unwrap();
+        assert!(health.askantis_models.is_none() && health.download_path.is_none());
     }
 
     #[test]

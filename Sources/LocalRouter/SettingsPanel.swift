@@ -44,7 +44,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .menuBar: ["icon", "memory", "context", "uptime", "percent", "status bar"]
         case .models: ["default", "keep", "loaded", "idle", "mlx", "gguf", "favorite"]
         case .schedule: ["time", "days", "hours", "weekday", "keep loaded"]
-        case .storage: ["folder", "disk", "drive", "external", "move", "symlink", "location"]
+        case .storage: ["folder", "disk", "drive", "external", "move", "symlink", "location", "speech", "hugging face", "askantis", "whisper"]
         case .ollama: ["address", "host", "port", "connection", "find", "status"]
         case .apps: ["apps", "connect", "connected", "scribely", "allow", "key", "service", "background", "daemon"]
         case .sharing: ["network", "share", "key", "token", "api", "auth", "password", "expose", "lan", "remote"]
@@ -366,7 +366,8 @@ private struct SchedulePane: View {
 private struct StoragePane: View {
     var body: some View {
         Form {
-            Section { ModelsFolderView() }
+            Section { ModelsFolderView() } header: { Text("Ollama Models") }
+            Section { SpeechModelPlacesView() } header: { Text("Speech Models") }
         }
     }
 }

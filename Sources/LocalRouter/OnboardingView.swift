@@ -277,8 +277,11 @@ private struct StorageStep: View {
     var body: some View {
         StepLayout(systemImage: "externaldrive.fill", color: .teal, title: "Where Models Live",
                    subtitle: "Models are big. Keep them on an external drive if your Mac's disk is small.") {
-            ModelsFolderView()
-                .frame(maxWidth: 470)
+            VStack(alignment: .leading, spacing: 18) {
+                ModelsFolderView()
+                SpeechModelPlacesView(hidesWhenStopped: true)
+            }
+            .frame(maxWidth: 470)
         }
     }
 }

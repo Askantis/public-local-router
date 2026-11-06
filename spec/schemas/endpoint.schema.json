@@ -79,11 +79,50 @@
           "enum": [
             "ok",
             "missing_volume",
+            "not_allowed",
             "unwritable",
             "checking"
           ]
         }
       }
+    },
+    "askantis_models": {
+      "description": "The Askantis models folder, the hf store's second folder (PROTOCOL.md, section 2). Optional: older versions don't write it.",
+      "type": "object",
+      "required": [
+        "path",
+        "state"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "enum": [
+            "ok",
+            "missing_volume",
+            "not_allowed",
+            "unwritable",
+            "checking"
+          ]
+        }
+      }
+    },
+    "download_target": {
+      "description": "Where Local Router puts new hf models (PROTOCOL.md, section 2). Optional.",
+      "enum": [
+        "askantis",
+        "huggingface",
+        "custom"
+      ]
+    },
+    "download_path": {
+      "description": "The folder download_target stands for. Optional.",
+      "type": "string"
     },
     "ollama": {
       "type": "object",

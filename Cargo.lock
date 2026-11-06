@@ -1517,6 +1517,7 @@ dependencies = [
  "anyhow",
  "clap 4.6.7",
  "localrouter-audio",
+ "localrouter-core",
  "localrouter-hf",
  "localrouter-speech",
  "serde",

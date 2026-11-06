@@ -298,6 +298,8 @@ paths:
                 - memory.pressure
                 - ollama.state
                 - hf_cache.state
+                - askantis_models.state
+                - download_target
                 - activity
                 - shutdown
 
@@ -718,13 +720,15 @@ paths:
     delete:
       tags: [Admin]
       operationId: adminDeleteModel
-      summary: Delete a model from its store. Only the user can do this.
+      summary: Delete an hf model from both folders. Only the user can do this. A model another Askantis app lists in <Askantis folder>/.apps/ is kept (409).
       security: [{}]
       x-socket-only: true
       parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string, examples: ["hf:org/repo"] } }
       responses:
         "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
 
   /lr/v1/admin/import:
     post:
@@ -748,6 +752,53 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Download" }
+
+  /lr/v1/admin/hf_cache/check:
+    post:
+      tags: [Admin]
+      operationId: adminCheckModelFolders
+      summary: Check the model folders again now, for example after the user allowed a drive. The hf_cache.state and askantis_models.state events tell the result.
+      security: [{}]
+      x-socket-only: true
+      responses:
+        "202": { description: Checking. }
+
+  /lr/v1/admin/download_target:
+    get:
+      tags: [Admin]
+      operationId: adminGetDownloadTarget
+      summary: Both hf folders, what they hold, and where new models go (PROTOCOL.md 2).
+      security: [{}]
+      x-socket-only: true
+      responses:
+        "200":
+          description: The folders and the target.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DownloadTarget" }
+    put:
+      tags: [Admin]
+      operationId: adminSetDownloadTarget
+      summary: Choose where new hf models go. Models already downloaded stay where they are and are still found.
+      security: [{}]
+      x-socket-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target: { enum: [askantis, huggingface, custom] }
+                path: { type: string, description: "For custom: an absolute folder path." }
+      responses:
+        "200":
+          description: The folders and the new target.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DownloadTarget" }
+        "400": { $ref: "#/components/responses/Error" }
 
   /lr/v1/admin/shutdown:
     post:
@@ -810,11 +861,35 @@ components:
           properties:
             state: { enum: [running, stopped, not_installed] }
             version: { type: ["string", "null"] }
-        hf_cache:
-          type: object
-          properties:
-            path: { type: ["string", "null"] }
-            state: { enum: [ok, missing_volume, unwritable, checking] }
+        hf_cache: { $ref: "#/components/schemas/ModelFolder" }
+        askantis_models: { $ref: "#/components/schemas/ModelFolder" }
+        download_target: { enum: [askantis, huggingface, custom] }
+        download_path: { type: string }
+
+    ModelFolder:
+      type: object
+      properties:
+        path: { type: ["string", "null"] }
+        state: { enum: [ok, missing_volume, not_allowed, unwritable, checking] }
+
+    DownloadTarget:
+      type: object
+      required: [target, path, folders]
+      properties:
+        target: { enum: [askantis, huggingface, custom] }
+        path: { type: string }
+        custom_path: { type: ["string", "null"] }
+        has_huggingface: { type: boolean }
+        folders:
+          type: array
+          items:
+            type: object
+            properties:
+              place: { enum: [askantis, huggingface] }
+              path: { type: string }
+              state: { enum: [ok, missing_volume, not_allowed, unwritable, checking] }
+              bytes: { type: integer, minimum: 0 }
+              models: { type: integer, minimum: 0 }
 
     Store:
       enum: [ollama, hf, app]
@@ -929,6 +1004,7 @@ components:
       properties:
         id: { type: string }
         store: { $ref: "#/components/schemas/Store" }
+        place: { enum: [askantis, huggingface, custom], description: For hf models, the folder it is in. }
         kind: { $ref: "#/components/schemas/ModelKind" }
         display_name: { type: string }
         maker: { type: string }
