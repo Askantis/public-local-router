@@ -329,6 +329,20 @@ pub struct Transcript {
     /// Which model did it: the `LR-Resolved-Model` header, or the embedded model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Where two speakers talk at once (`lr_speakers_json`; empty without speakers).
+    #[serde(default)]
+    pub overlaps: Vec<Overlap>,
+}
+
+/// Two speakers talking at once, at least half a second (PROTOCOL.md 11.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Overlap {
+    pub start: f64,
+    pub end: f64,
+    /// Speaker labels as in the segments, sorted.
+    pub speakers: Vec<String>,
+    #[serde(default)]
+    pub duration_s: f64,
 }
 
 impl Client {
@@ -1088,12 +1102,22 @@ pub mod embedded {
                 )
             })?
             .map_err(|e| err(format!("{e:#}")))?;
+            // The speaker separation just run knows where speakers overlapped.
+            let overlaps = match slot.as_ref().and_then(|g| g.as_ref()) {
+                Some(d) if opts.segments.is_none() => d
+                    .overlaps()
+                    .iter()
+                    .map(|o| Overlap { start: o.start + offset, end: o.end + offset, speakers: o.speakers.iter().map(|s| short_label(s)).collect(), duration_s: o.duration_s })
+                    .collect(),
+                _ => Vec::new(),
+            };
             Ok(Transcript {
                 language: t.language.clone().unwrap_or_default(),
                 duration: t.duration_s,
                 text: t.turns.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join(" "),
                 segments: t.turns.iter().map(segment).collect(),
                 model: Some(catalog::whisper_model_id(&self.inner.whisper)),
+                overlaps,
             })
         }
     }
@@ -1237,6 +1261,9 @@ mod tests {
             "words": [{ "word": "Hoi", "start": 0.1, "end": 0.5, "probability": 0.9 }] }], "overlaps": [] });
         let t: Transcript = serde_json::from_value(v).unwrap();
         assert_eq!(t.segments[0].speaker.as_deref(), Some("S1"));
+        assert!(t.overlaps.is_empty());
+        let v = json!({ "language": "de", "duration": 2.0, "text": "", "segments": [], "overlaps": [{ "start": 0.5, "end": 1.2, "speakers": ["S1", "S2"], "duration_s": 0.7 }] });
+        assert_eq!(serde_json::from_value::<Transcript>(v).unwrap().overlaps[0].speakers, vec!["S1", "S2"]);
         assert_eq!(t.segments[0].words[0].word, "Hoi");
         let plain = json!({ "task": "transcribe", "language": "de", "duration": 2.0, "text": "Hoi", "segments": [{ "id": 0, "start": 0.1, "end": 0.5, "text": "Hoi" }] });
         let t: Transcript = serde_json::from_value(plain).unwrap();
