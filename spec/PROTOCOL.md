@@ -63,7 +63,7 @@ Local Router never replaces the tools underneath it. Ollama stays the place wher
 | Store | Where | Managed through |
 |---|---|---|
 | `ollama` | Ollama's models folder | Ollama's API |
-| `hf` | The Hugging Face cache, in its standard layout | Local Router, compatible with `huggingface_hub` |
+| `hf` | The Hugging Face cache and the Askantis models folder, both in the Hugging Face layout | Local Router, compatible with `huggingface_hub` |
 | `app` | Inside an app's own process | The app, which reports it (section 9) |
 
 **Model ids.** Strings in one of these forms:
@@ -78,14 +78,23 @@ Local Router never replaces the tools underneath it. Ollama stays the place wher
 
 An `hf:` id MAY end in `@<revision>` (a 40-character commit hash or a branch name). Without it, the revision is the one `refs/main` points to. The prefix `localrouter/` is reserved and is never an Ollama namespace.
 
-**Standard places.** Local Router and every app that follows this protocol find the Hugging Face cache like this, and MUST NOT keep models anywhere else:
+**Standard places.** The `hf` store has two folders. Both use the Hugging Face cache layout (`models--<org>--<repo>/blobs|snapshots|refs`), and an `hf:` id means the same model in either. Local Router and every app that follows this protocol MUST NOT keep models anywhere else, except in a folder the user chose.
+
+- **The Askantis models folder**, shared by every Askantis app: `ASKANTIS_MODELS` if set, otherwise `~/Library/Application Support/Askantis/Models` on macOS. Programs SHOULD exclude it from backups, since everything in it can be downloaded again.
+- **The Hugging Face cache**, shared with Hugging Face tools, found as below.
+
+Programs MUST look for a model in both folders before downloading it, and MUST NOT download a model that is in either. New downloads go to one **target**: the folder the user chose, otherwise the Askantis folder for people who chose the simple setup, otherwise the Hugging Face cache if this computer already uses Hugging Face (one of the variables below is set, or the cache holds a `models--` folder), otherwise the Askantis folder.
+
+Each app MAY record the models it uses in `<Askantis folder>/.apps/<app_id>.json` (`{"app_id": "…", "models": ["<org>/<repo>", …]}`). An app that removes models MUST NOT remove one that another app lists there.
+
+The Hugging Face cache is found like this:
 
 1. `HF_HUB_CACHE`, if set.
 2. Otherwise `HF_HOME` + `/hub`, if `HF_HOME` is set.
 3. Otherwise `XDG_CACHE_HOME` + `/huggingface/hub`, if `XDG_CACHE_HOME` is set.
 4. Otherwise `~/.cache/huggingface/hub`.
 
-On macOS, apps started from the Finder do not see variables from shell profiles. An implementation on macOS MUST also check `launchctl getenv` for these variables before using the default. When `localrouterd` runs, the path it resolved is in the discovery file (section 4), and apps SHOULD use that path so every program agrees.
+On macOS, apps started from the Finder do not see variables from shell profiles. An implementation on macOS MUST also check `launchctl getenv` for these variables before using the default. When `localrouterd` runs, the paths it resolved are in the discovery file (section 4), and apps SHOULD use those paths so every program agrees.
 
 ## 3. Transport
 
@@ -143,6 +152,8 @@ It writes to a temporary file in the same folder and renames it into place, so r
   "http": "http://127.0.0.1:11436",
   "socket": "/Users/me/Library/Application Support/Local Router/lr.sock",
   "hf_cache": { "path": "/Users/me/.cache/huggingface/hub", "state": "ok" },
+  "askantis_models": { "path": "/Users/me/Library/Application Support/Askantis/Models", "state": "ok" },
+  "download_target": "askantis",
   "ollama": { "url": "http://127.0.0.1:11434", "state": "running", "version": "0.34.4" },
   "capabilities": ["connect", "roles", "resident", "downloads", "events",
                    "audio.transcriptions", "audio.diarizations", "chat", "embeddings",
@@ -150,7 +161,7 @@ It writes to a temporary file in the same folder and renames it into place, so r
 }
 ```
 
-`protocols` lists every protocol version the service speaks (section 13). `hf_cache.state` is `ok`, `missing_volume` (the cache is on a drive that isn't connected), `not_allowed` (macOS privacy keeps the service out of the drive or folder: the person said no, or hasn't answered yet), `unwritable`, or `checking` while the service is still finding out. Checking can take a while: macOS asks the user before a background process reads a removable drive. The `hf_cache.state` event announces every change. While the state isn't `ok`, the service checks again every 15 seconds; `POST /lr/v1/admin/hf_cache/check` (admin) checks right away, for example after the person allowed the drive in System Settings. `ollama.state` is `running`, `stopped` or `not_installed`.
+`protocols` lists every protocol version the service speaks (section 13). `hf_cache.state` is `ok`, `missing_volume` (the cache is on a drive that isn't connected), `not_allowed` (macOS privacy keeps the service out of the drive or folder: the person said no, or hasn't answered yet), `unwritable`, or `checking` while the service is still finding out. Checking can take a while: macOS asks the user before a background process reads a removable drive. The `hf_cache.state` event announces every change. While the state isn't `ok`, the service checks again every 15 seconds; `POST /lr/v1/admin/hf_cache/check` (admin) checks right away, for example after the person allowed the drive in System Settings. `askantis_models` is the Askantis models folder, with the same states. `download_target` is where Local Router puts new models: `askantis`, `huggingface` or `custom` (section 2). `ollama.state` is `running`, `stopped` or `not_installed`.
 
 The file can be stale after a crash. A client MUST confirm with `GET /lr/v1/health` that the service answers and that `instance_id` matches before relying on it.
 
